@@ -1,0 +1,1 @@
+{"stale_order_hours":24,"stale_atr_distance":3.0,"volume_drop_threshold":0.25,"volume_spike_threshold":3.0,"min_volume_24h_usd":500000,"aged_position_hours":24,"morning_brief_hour_utc":8,"brain_interval_s":300,"quality_interval_s":3600,"health_interval_s":21600}
