@@ -1,0 +1,8 @@
+.env
+.env.readonly
+*.db
+*.jsonl
+.venv/
+__pycache__/
+*.bak*
+day_anchor.json

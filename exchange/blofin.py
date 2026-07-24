@@ -4,7 +4,8 @@ import aiohttp
 from dotenv import load_dotenv
 load_dotenv("/root/trading/.env")
 
-BASE_URL   = "https://openapi.blofin.com"
+IS_DEMO    = os.getenv("IS_DEMO","true").lower() == "true"
+BASE_URL   = "https://demo-trading-openapi.blofin.com" if IS_DEMO else "https://openapi.blofin.com"
 API_KEY    = os.getenv("BLOFIN_API_KEY","")
 SECRET     = os.getenv("BLOFIN_SECRET","")
 PASSPHRASE = os.getenv("BLOFIN_PASSPHRASE","")
