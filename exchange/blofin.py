@@ -202,3 +202,61 @@ class BloFinClient:
         est=contracts*price*cv
         print(f"  [SIZE] {inst_id} contracts={contracts} est_notional=${est:.2f}")
         return contracts
+
+    async def place_tpsl(self, inst_id, side, sl_trigger, size=None):
+        """Place a server-side stop-loss (TPSL). side = position side being protected.
+        For a LONG position, side='long', stop triggers when price falls to sl_trigger.
+        Reduce-only market close on trigger. Guarded by LIVE_TRADING_ENABLED."""
+        if not LIVE_TRADING_ENABLED:
+            print(f"  🚫 DRY-RUN: would place STOP for {inst_id} {side} trigger={sl_trigger} — BLOCKED")
+            return "DRYRUN"
+        inst = await self.get_instrument(inst_id)
+        tick = float(inst.get("tickSize","0.01"))
+        # close side is opposite of position side
+        close_side = "sell" if side == "long" else "buy"
+        body = {
+            "instId": inst_id, "marginMode": "cross", "positionSide": "net",
+            "side": close_side,
+            "slTriggerPrice": round_price(sl_trigger, tick),
+            "slOrderPrice": "-1",     # -1 = market order on trigger
+            "size": "-1",             # -1 = entire position
+            "reduceOnly": "true",
+            "triggerPriceType": "mark"
+        }
+        d = await self._req("POST","/api/v1/trade/order-tpsl",body=body,private=True)
+        if d and isinstance(d, list):
+            item = d[0]
+            tpsl_id = item.get("tpslId") or item.get("algoId","")
+            if tpsl_id or str(item.get("code","0"))=="0":
+                print(f"  🛡️ STOP armed {inst_id} @ {round_price(sl_trigger,tick)} (id={tpsl_id})")
+                return tpsl_id
+            print(f"  Failed TPSL {inst_id}: {item.get('msg')}")
+        return None
+
+    async def get_tpsl_orders(self, inst_id=None):
+        """Get pending TPSL (stop) orders, optionally filtered by pair."""
+        params = {}
+        if inst_id: params["instId"] = inst_id
+        d = await self._req("GET","/api/v1/trade/orders-tpsl-pending",
+                            params=params or None, private=True)
+        return d if isinstance(d, list) else []
+
+    async def cancel_tpsl(self, inst_id, tpsl_id):
+        """Cancel a specific TPSL stop order."""
+        if not LIVE_TRADING_ENABLED:
+            print(f"  🚫 DRY-RUN: would cancel TPSL {tpsl_id} for {inst_id} — BLOCKED")
+            return "DRYRUN"
+        body = [{"instId": inst_id, "tpslId": str(tpsl_id)}]
+        d = await self._req("POST","/api/v1/trade/cancel-tpsl",body=body,private=True)
+        return d is not None
+
+    async def cancel_all_tpsl(self, inst_id):
+        """Cancel every pending stop for a pair (used before re-placing on ratchet)."""
+        orders = await self.get_tpsl_orders(inst_id)
+        count = 0
+        for o in orders:
+            tid = o.get("tpslId") or o.get("algoId","")
+            if tid and await self.cancel_tpsl(inst_id, tid):
+                count += 1
+            await asyncio.sleep(0.1)
+        return count
