@@ -2,13 +2,14 @@ import asyncio, base64, hashlib, hmac, json, os, time, uuid
 from decimal import Decimal, ROUND_HALF_UP
 import aiohttp
 from dotenv import load_dotenv
-load_dotenv("/root/trading/.env")
+load_dotenv(os.getenv("ENV_FILE", "/root/trading/.env"))
 
 IS_DEMO    = os.getenv("IS_DEMO","true").lower() == "true"
 BASE_URL   = "https://demo-trading-openapi.blofin.com" if IS_DEMO else "https://openapi.blofin.com"
 API_KEY    = os.getenv("BLOFIN_API_KEY","")
 SECRET     = os.getenv("BLOFIN_SECRET","")
 PASSPHRASE = os.getenv("BLOFIN_PASSPHRASE","")
+LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED","false").lower() == "true"
 
 def _sign(ts, nonce, method, path, body=""):
     prehash = path + method.upper() + ts + nonce + body
@@ -61,6 +62,9 @@ class BloFinClient:
             await self._session.close()
 
     async def _req(self, method, path, params=None, body=None, private=False):
+        if method == "POST" and "/trade/" in path and not LIVE_TRADING_ENABLED:
+            print(f"  🚫 DRY-RUN: blocked {method} {path} (LIVE_TRADING_ENABLED=false) body={body}")
+            return "DRYRUN"
         s=await self._sess(); url=BASE_URL+path
         bs=json.dumps(body) if body else ""
         hdrs=_headers(method, path, bs, params) if private else {"Content-Type":"application/json"}
@@ -147,6 +151,9 @@ class BloFinClient:
         return d if isinstance(d,list) else []
 
     async def place_order(self, inst_id, side, price=None, size=None, reduce_only=False, order_type="limit"):
+        if not LIVE_TRADING_ENABLED:
+            print(f"  🚫 DRY-RUN: would {side} {size} {inst_id} @ {price or 'MARKET'} ({order_type}) — order BLOCKED (LIVE_TRADING_ENABLED=false)")
+            return "DRYRUN"
         if size is None or size <= 0: return False
         inst=await self.get_instrument(inst_id)
         tick=float(inst.get("tickSize","0.01"))
