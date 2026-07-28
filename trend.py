@@ -162,6 +162,10 @@ async def scan(client, state):
             f"💰 Margin: ${margin} @ {config.trend_leverage}x\n"
             f"⚡ Executing...")
         trade = await execute_entry(client, signal, equity)
+        if trade == "DRYRUN":
+            print(f"  [DRY-RUN] {pair} {direction} logged, not traded")
+            slots -= 1; new_count += 1
+            continue
         if trade:
             state["open_trades"].append(trade)
             slots -= 1
