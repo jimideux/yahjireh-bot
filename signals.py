@@ -29,15 +29,19 @@ def is_trading_hours():
 async def get_candles_binance(pair, interval="1h", limit=60):
     symbol   = SYMBOL_MAP.get(pair, pair.replace("-",""))
     interval = INTERVAL_MAP.get(interval, interval.lower())
-    url      = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    # Binance geoblocks this server (HTTP 451) -> use BloFin candles
+    bar = {"1h":"1H","4h":"4H","1d":"1D","15m":"15m","5m":"5m"}.get(interval, "1H")
+    url = f"https://openapi.blofin.com/api/v1/market/candles?instId={pair}&bar={bar}&limit={limit}"
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json()
-                if isinstance(data, list):
-                    return data
+                j = await r.json()
+                data = j.get("data") if isinstance(j, dict) else None
+                if isinstance(data, list) and data:
+                    # BloFin returns newest-first; reverse to oldest-first
+                    return sorted(data, key=lambda x: int(x[0]))
     except Exception as e:
-        print(f"Binance candle error {pair}: {e}")
+        print(f"Candle error {pair}: {e}")
     return []
 
 # ── EMA calculation ───────────────────────────────────────────────────────────
