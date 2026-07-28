@@ -164,6 +164,7 @@ async def scan(client, state):
         trade = await execute_entry(client, signal, equity)
         if trade == "DRYRUN":
             print(f"  [DRY-RUN] {pair} {direction} logged, not traded")
+            state["cooldowns"][pair] = time.time() + 3600
             slots -= 1; new_count += 1
             continue
         if trade:
