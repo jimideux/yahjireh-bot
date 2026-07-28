@@ -1,6 +1,7 @@
 import asyncio, sys, time, json, aiohttp
 sys.path.insert(0, "/root/trading")
 from love import config
+import journal
 from exchange.blofin import BloFinClient, round_price, _headers, LIVE_TRADING_ENABLED
 from signals import get_atr_binance
 from joy import send
@@ -50,6 +51,16 @@ async def place_tp_order(inst_id, side, price, size, margin_mode, tick):
         return False
 
 async def close_market(client, inst_id, size, reason, margin_mode):
+    try:
+        _pos = await client.get_positions()
+        for _p in _pos:
+            if _p.get("instId")==inst_id:
+                _u = float(_p.get("unrealizedPnl",0) or 0)
+                _mk = float(_p.get("markPrice",0) or 0)
+                journal.close_trade(inst_id, _mk, reason, _u,
+                    fees=abs(float(_p.get("notional",0) or 0))*0.0012)
+                break
+    except Exception as _e: print(f"journal close err: {_e}")
     if not LIVE_TRADING_ENABLED:
         print(f"  🚫 DRY-RUN peace: would CLOSE {inst_id} ({reason}) — BLOCKED")
         return "DRYRUN"
@@ -148,6 +159,8 @@ async def check_position(client, pos):
     if upnl > prev_high:
         _profit_highs[inst_id] = upnl
         prev_high = upnl
+    try: journal.update_path(inst_id, upnl)
+    except Exception: pass
     lock = get_trail_lock(prev_high)
     if lock is not None:
         if upnl > 0 and upnl <= lock:

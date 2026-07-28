@@ -4,6 +4,8 @@ from love import config
 from exchange.blofin import BloFinClient, round_price, _headers, LIVE_TRADING_ENABLED
 from joy import send
 from declog import log_decision
+import journal
+journal.init()
 import aiohttp
 
 STATE_FILE = "/root/trading/trend_state.json"
@@ -123,6 +125,10 @@ async def monitor(client, state):
     state["open_trades"] = still_open
 
 async def scan(client, state):
+    import os as _os
+    if _os.path.exists("/root/trading/PAUSED"):
+        print("  [TREND] PAUSED - skipping scan")
+        return
     positions  = await client.get_positions()
     # Only count isolated margin positions as trend slots
     isolated   = [p for p in positions if p.get("marginMode","cross")=="isolated"]
@@ -164,10 +170,23 @@ async def scan(client, state):
         trade = await execute_entry(client, signal, equity)
         if trade == "DRYRUN":
             print(f"  [DRY-RUN] {pair} {direction} logged, not traded")
+            try:
+                _px = signal.get("price") or 0
+                _notional = margin * config.trend_leverage
+                journal.open_trade("dry", pair, signal["direction"], _px,
+                    _notional/_px if _px else 0, _notional, config.trend_leverage, margin,
+                    sig=signal, equity=equity)
+            except Exception as _e: print(f"journal err: {_e}")
             state["cooldowns"][pair] = time.time() + 3600
             slots -= 1; new_count += 1
             continue
         if trade:
+            try:
+                journal.open_trade("live", pair, trade["direction"], trade["entry"],
+                    trade["notional"]/trade["entry"] if trade["entry"] else 0,
+                    trade["notional"], config.trend_leverage, trade["margin"],
+                    sig=signal, equity=equity)
+            except Exception as _e: print(f"journal err: {_e}")
             state["open_trades"].append(trade)
             slots -= 1
             new_count += 1
