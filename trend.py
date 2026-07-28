@@ -3,6 +3,7 @@ sys.path.insert(0, "/root/trading")
 from love import config
 from exchange.blofin import BloFinClient, round_price, _headers, LIVE_TRADING_ENABLED
 from joy import send
+from declog import log_decision
 import aiohttp
 
 STATE_FILE = "/root/trading/trend_state.json"
@@ -147,6 +148,10 @@ async def scan(client, state):
             continue
         direction = signal["direction"].upper()
         emoji     = "📈" if signal["direction"]=="long" else "📉"
+        log_decision(pair, signal["direction"], signal.get("price"),
+                     {"ema20": signal.get("ema20"), "ema50": signal.get("ema50"),
+                      "dist_pct": signal.get("dist_pct"), "vol_ratio": signal.get("vol_ratio"),
+                      "equity": round(equity,2)})
         margin    = round(equity * config.trend_margin_pct, 2)
         await send(
             f"🎯 <b>Trend Signal!</b>\n"
