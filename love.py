@@ -29,26 +29,26 @@ class Config:
     max_new_entries_per_scan:  int   = 2
 
     # ── Trend Bot ─────────────────────────────────────────
-    trend_leverage:            int   = 4
-    trend_margin_pct:          float = 0.24
+    trend_leverage:            int   = 3
+    trend_margin_pct:          float = 0.15
     trend_max_slots:           int   = 2
     ema_short:                 int   = 20
     ema_long:                  int   = 50
     ema_period:                int   = 50
-    ema_threshold:             float = 0.015
-    trend_vol_min:             float = 0.20
+    ema_threshold:             float = 0.008
+    trend_vol_min:             float = 0.50
     trend_entry_offset:        float = 0.0005
-    trend_tp_pct:              float = 0.0075
-    trend_sl_pct:              float = 0.00375
+    trend_tp_pct:              float = 0.025
+    trend_sl_pct:              float = 0.010
 
     # ── TP / SL ───────────────────────────────────────────
     atr_tp_mult:               float = 2.0
     atr_sl_mult:               float = 1.0
     min_tp_pct:                float = 0.003
-    max_loss_usd:              float = 13.0
+    max_loss_usd:              float = 20.0
     max_total_open_loss_usd:   float = 66.0
     max_position_notional_usd: float = 550.0
-    max_dd_pct:                float = 0.03
+    max_dd_pct:                float = 0.04
 
     # ── Volume Filters ────────────────────────────────────
     min_volume_24h_usd:        float = 300000.0

@@ -1,7 +1,7 @@
 import asyncio, sys, time, json, os
 sys.path.insert(0, "/root/trading")
 from love import config
-from exchange.blofin import BloFinClient, round_price, _headers
+from exchange.blofin import BloFinClient, round_price, _headers, LIVE_TRADING_ENABLED
 from joy import send
 import aiohttp
 
@@ -76,6 +76,9 @@ async def execute_entry(client, signal, equity):
         "size":         size_str,
     }
     bs   = json.dumps(body)
+    if not LIVE_TRADING_ENABLED:
+        print(f"  🚫 DRY-RUN trend: would place ENTRY order — BLOCKED")
+        return "DRYRUN"
     hdrs = _headers("POST", "/api/v1/trade/order", bs)
     async with aiohttp.ClientSession() as s:
         async with s.post("https://openapi.blofin.com/api/v1/trade/order",

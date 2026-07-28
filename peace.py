@@ -1,7 +1,7 @@
 import asyncio, sys, time, json, aiohttp
 sys.path.insert(0, "/root/trading")
 from love import config
-from exchange.blofin import BloFinClient, round_price, _headers
+from exchange.blofin import BloFinClient, round_price, _headers, LIVE_TRADING_ENABLED
 from signals import get_atr_binance
 from joy import send
 
@@ -9,14 +9,19 @@ from joy import send
 _profit_highs = {}  # tracks highest profit seen per position
 
 def get_trail_lock(high_watermark):
-    """Returns the locked profit floor based on highest profit seen."""
-    if high_watermark >= 16: return 14.0
-    if high_watermark >= 11: return 9.0
-    if high_watermark >= 8: return 6.5
-    if high_watermark >= 5: return 4.0
+    """Swing Sniper trail: breakeven at +$20, then trail ~$15-18 behind peak.
+    Lets trending winners run to $50-100 instead of banking $6.50."""
+    if high_watermark >= 100: return high_watermark - 18
+    if high_watermark >= 70:  return high_watermark - 16
+    if high_watermark >= 50:  return high_watermark - 15
+    if high_watermark >= 35:  return 20.0   # peak $35 -> lock $20
+    if high_watermark >= 20:  return 0.0    # peak $20 -> breakeven (risk-free)
     return None  # not yet at target — normal SL applies
 
 async def place_tp_order(inst_id, side, price, size, margin_mode, tick):
+    if not LIVE_TRADING_ENABLED:
+        print(f"  🚫 DRY-RUN peace: would place TP {inst_id} {side} @ {price} — BLOCKED")
+        return "DRYRUN"
     body = {
         "instId":       inst_id,
         "marginMode":   margin_mode,
@@ -45,6 +50,9 @@ async def place_tp_order(inst_id, side, price, size, margin_mode, tick):
         return False
 
 async def close_market(client, inst_id, size, reason, margin_mode):
+    if not LIVE_TRADING_ENABLED:
+        print(f"  🚫 DRY-RUN peace: would CLOSE {inst_id} ({reason}) — BLOCKED")
+        return "DRYRUN"
     try:
         await client.cancel_all_orders(inst_id)
         await asyncio.sleep(0.3)
