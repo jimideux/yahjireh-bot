@@ -128,6 +128,15 @@ async def get_signal(pair, ema_short=20, ema_long=50,
     # Direction from EMA crossover
     trend = "long" if ema20 > ema50 else "short"
 
+    # MOMENTUM GATE: last 3 candles must confirm direction.
+    # Blocks shorting into rising price / buying into falling price.
+    if len(closes) >= 4:
+        recent = (closes[-1] - closes[-4]) / closes[-4]
+        if trend == "short" and recent > 0.001:
+            return None   # price rising - do not short
+        if trend == "long" and recent < -0.001:
+            return None   # price falling - do not long
+
     # Dynamic RSI filter — adjusts based on BTC trend strength
     rsi = calc_rsi(closes)
     # In strong bear trend, RSI stays low — lower the threshold

@@ -144,6 +144,15 @@ async def scan(client, state):
     for pair in config.active_pairs:
         if slots <= 0 or new_count >= config.max_new_entries_per_scan: break
         if pair in live_pairs or pair in open_pairs: continue
+        try:
+            import sqlite3 as _sq
+            _jc = _sq.connect("/root/trading/journal.db")
+            _busy = _jc.execute("SELECT COUNT(*) FROM trades WHERE pair=? AND mode='dry' AND status='open'", (pair,)).fetchone()[0]
+            _jc.close()
+            if _busy:
+                print(f"  [TREND] {pair}: dry trade open - occupied")
+                continue
+        except Exception: pass
         if time.time() < state["cooldowns"].get(pair, 0):
             rem = int((state["cooldowns"][pair] - time.time())/60)
             print(f"  [TREND] {pair}: cooldown {rem}min")
