@@ -128,6 +128,18 @@ async def get_signal(pair, ema_short=20, ema_long=50,
     # Direction from EMA crossover
     trend = "long" if ema20 > ema50 else "short"
 
+    # REGIME FILTER: only trade real trends, sit out chop.
+    # 1) EMA separation must be meaningful (>0.4%)
+    ema_sep = abs(ema20 - ema50) / ema50
+    if ema_sep < 0.004:
+        return None
+    # 2) Separation must be WIDENING (trend strengthening, not dying)
+    ema20_prev = calc_ema(closes[:-2], 20)
+    ema50_prev = calc_ema(closes[:-2], 50)
+    sep_prev = abs(ema20_prev - ema50_prev) / ema50_prev if ema50_prev else 0
+    if ema_sep < sep_prev:
+        return None
+
     # MOMENTUM GATE: last 3 candles must confirm direction.
     # Blocks shorting into rising price / buying into falling price.
     if len(closes) >= 4:
