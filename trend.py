@@ -4,6 +4,7 @@ from love import config
 from exchange.blofin import BloFinClient, round_price, _headers, LIVE_TRADING_ENABLED
 from joy import send
 from declog import log_decision
+import ownership
 import journal
 journal.init()
 import aiohttp
@@ -90,6 +91,13 @@ async def execute_entry(client, signal, equity):
             oid = d.get("data",[{}])[0].get("orderId","") if d.get("data") else ""
             if oid:
                 print(f"  ✅ Trend entry: {pair} {direction} @ {entry_px:.4f} size={size_str}")
+                # Claim ONLY after the exchange confirms. A claim on a
+                # rejected order would make peace.py adopt whatever
+                # happens to be open on this pair.
+                if not ownership.claim(pair, direction, "live",
+                                       entry_px, oid):
+                    print(f"  \u26A0\uFE0F  {pair} claim did NOT persist - "
+                          f"peace.py will not manage this position")
                 return {"pair": pair, "direction": direction,
                         "entry": round(entry_px,6), "margin": margin,
                         "notional": round(notional,2), "order_id": oid,
@@ -130,20 +138,38 @@ async def scan(client, state):
         print("  [TREND] PAUSED - skipping scan")
         return
     positions  = await client.get_positions()
-    # Only count isolated margin positions as trend slots
-    isolated   = [p for p in positions if p.get("marginMode","cross")=="isolated"]
-    live_pairs = {p.get("instId") for p in isolated}
+    released   = ownership.reconcile([p.get("instId","") for p in positions])
+    if released:
+        print(f"  [TREND] released closed claims: {', '.join(released)}")
+    # Only BOT-OWNED positions consume trend slots. Manual trades on
+    # the same account are not the bot's business and must not reduce
+    # its capacity. Union with state["open_trades"] so a claim that
+    # failed to persist cannot cause double-entry.
+    live_pairs = {p.get("instId") for p in positions
+                  if ownership.is_owned(p.get("instId",""))}
     open_pairs = [t["pair"] for t in state["open_trades"]]
-    slots      = config.trend_max_slots - len(live_pairs)
+    occupied   = live_pairs | set(open_pairs)
+    slots      = config.trend_max_slots - len(occupied)
     if slots <= 0:
-        print(f"  [TREND] {len(live_pairs)} slots full")
+        print(f"  [TREND] {len(occupied)} slots full")
         return
     equity = await client.get_equity()
-    print(f"[TREND] Scan | equity=${equity:.2f} | slots={config.trend_max_slots-len(live_pairs)}")
+    print(f"[TREND] Scan | equity=${equity:.2f} | slots={slots}")
     new_count = 0
+    # Entry eligibility is NOT the same question as slot accounting.
+    # Slots count only bot-owned positions, but a pair is off-limits
+    # for a NEW entry if ANY position exists on it, whoever opened it:
+    # BloFin runs positionSide="net", so an order on a held pair merges
+    # into that position rather than creating a separate one. The merged
+    # position would then be claimed and closed by peace.py with the
+    # manual size included. A merge cannot be undone after the fact.
+    all_open_pairs = {p.get("instId") for p in positions}
     for pair in config.active_pairs:
         if slots <= 0 or new_count >= config.max_new_entries_per_scan: break
-        if pair in live_pairs or pair in open_pairs: continue
+        if pair in all_open_pairs or pair in open_pairs:
+            if pair in all_open_pairs and not ownership.is_owned(pair):
+                print(f"  [TREND] {pair}: position held externally - skipping")
+            continue
         try:
             import sqlite3 as _sq
             _jc = _sq.connect("/root/trading/journal.db")

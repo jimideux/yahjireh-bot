@@ -8,3 +8,5 @@ __pycache__/
 *.bak*
 day_anchor.json
 paper.db
+bot_positions.json
+trend_state.json

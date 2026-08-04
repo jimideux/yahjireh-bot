@@ -5,6 +5,7 @@ import journal
 from exchange.blofin import BloFinClient, round_price, _headers, LIVE_TRADING_ENABLED
 from signals import get_atr_binance
 from joy import send
+import ownership
 
 # ── Trailing profit lock ─────────────────────────────────────────────────────
 _profit_highs = {}  # tracks highest profit seen per position
@@ -42,10 +43,18 @@ async def place_tp_order(inst_id, side, price, size, margin_mode, tick):
                 data=bs, headers=hdrs,
                 timeout=aiohttp.ClientTimeout(total=10)) as r:
                 d    = await r.json()
-                data = d.get("data", [{}])
-                oid  = data[0].get("orderId","") if data else ""
-                code = str(d.get("code","1"))
-                return bool(oid) or code == "0"
+                rows = d.get("data") or [{}]
+                row  = rows[0] if rows else {}
+                oid  = row.get("orderId", "")
+                # Per-order code lives in data[0], NOT at the top
+                # level. Top-level "0" only means the request was
+                # well-formed -- the order itself can still fail.
+                row_code = str(row.get("code", "0"))
+                if oid and row_code == "0":
+                    return True
+                print(f"  TP rejected {inst_id}: code={row_code} "
+                      f"msg={row.get('msg') or d.get('msg')}")
+                return False
     except Exception as e:
         print(f"  TP order error {inst_id}: {e}")
         return False
@@ -201,7 +210,10 @@ async def check_position(client, pos):
         tp_side  = "sell" if is_long else "buy"
         abs_size = abs(size)
         ok = await place_tp_order(inst_id, tp_side, tp_price, abs_size, margin_mode, tick)
-        if ok:
+        if ok == "DRYRUN":
+            print(f"  \U0001F6AB DRY-RUN: no TP exists for {inst_id} "
+                  f"(would be ${tp_price:.4f})")
+        elif ok is True:
             print(f"  ✅ TP placed: {inst_id} @ ${tp_price:.4f} (ATR×{config.atr_tp_mult})")
             await send(
                 f"🎯 <b>TP Set</b>\n"
@@ -230,7 +242,13 @@ async def main():
     client = BloFinClient()
     while True:
         try:
-            positions  = await client.get_positions()
+            all_positions = await client.get_positions()
+            positions = [p for p in all_positions
+                         if ownership.is_owned(p.get("instId", ""))]
+            skipped = [p.get("instId", "?") for p in all_positions
+                       if not ownership.is_owned(p.get("instId", ""))]
+            if skipped:
+                print(f"[PEACE] ignoring unowned: {', '.join(skipped)}")
             total_upnl = sum(float(p.get("unrealizedPnl",0)) for p in positions)
 
             # Global stop
