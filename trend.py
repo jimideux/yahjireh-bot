@@ -275,6 +275,34 @@ async def scan(client, state):
         else:
             await send(f"❌ Entry failed: {pair}")
 
+async def feed_risk_outcomes(client, state):
+    """Tail journal.db for newly closed trades and feed each outcome to
+    the risk engine. trend.py is the SOLE writer of risk state -- other
+    processes write closes to the journal and this loop picks them up.
+    Never raises: an sqlite hiccup must not stop scanning."""
+    try:
+        import sqlite3
+        last = int(state.get("last_close_id", 0))
+        c = sqlite3.connect("/root/trading/journal.db")
+        c.row_factory = sqlite3.Row
+        rows = c.execute(
+            "SELECT id, pair, mode, net_pnl FROM trades "
+            "WHERE status='closed' AND id > ? ORDER BY id", (last,)
+        ).fetchall()
+        c.close()
+        if not rows:
+            return
+        equity = await client.get_equity()
+        for r in rows:
+            pnl = float(r["net_pnl"] or 0.0)
+            _risk.record_close(pnl, equity)
+            state["last_close_id"] = int(r["id"])
+            streak = _risk.snapshot()["consecutive_losses"]
+            print(f"  [RISK] outcome {r['pair']} [{r['mode']}] "
+                  f"net ${pnl:+.2f} | loss streak: {streak}")
+    except Exception as e:
+        print(f"  [RISK] outcome feed error: {e}")
+
 async def main():
     print("Trend Bot starting...")
     state  = load_state()
@@ -293,6 +321,7 @@ async def main():
     while True:
         try:
             await monitor(client, state)
+            await feed_risk_outcomes(client, state)
             await scan(client, state)
             save_state(state)
         except Exception as e:

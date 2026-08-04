@@ -29,14 +29,27 @@ async def resolve_once(client):
         journal.update_path(t['pair'], upnl)
         peak = max(t['peak_pnl'] or 0, upnl)
         lock = get_trail_lock(peak)
+        # Exits must mirror the DEPLOYED strategy: ATR-based, same
+        # formulas as peace.py/trend.py. sig_atr was recorded at entry;
+        # fall back to the old fixed percentages only if it is missing.
+        atr = float(t['sig_atr'] or 0)
+        if atr > 0:
+            tp_dist = max(atr * config.atr_tp_mult, entry * config.min_tp_pct)
+            sl_dist = atr * config.atr_sl_mult
+        else:
+            tp_dist = entry * config.trend_tp_pct
+            sl_dist = entry * config.trend_sl_pct
+            print(f"[RESOLVER] {t['pair']}: no sig_atr, using pct fallback")
+        favor = (mark - entry) * d   # signed $ move per unit in our favor
         reason = None
-        if move >= config.trend_tp_pct:      reason = 'take-profit'
-        elif move <= -config.trend_sl_pct:   reason = 'stop-loss'
+        if favor >= tp_dist:    reason = 'take-profit'
+        elif favor <= -sl_dist: reason = 'stop-loss'
         elif lock is not None and upnl <= lock and peak > 0: reason = f'trail-lock ${lock:.0f}'
         if reason:
             fees = t['notional'] * 0.0012
+            risk_usd = t['notional'] * (sl_dist / entry) if entry else 0
             journal.close_trade(t['pair'], mark, reason, upnl, fees=fees,
-                                risk=t['notional'] * config.trend_sl_pct, mode='dry')
+                                risk=risk_usd, mode='dry')
             print(f"[RESOLVER] {t['pair']} {t['direction']} CLOSED {reason} net ${upnl - fees:+.2f}")
 
 async def main():

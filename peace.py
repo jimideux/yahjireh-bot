@@ -116,7 +116,8 @@ async def close_market(client, inst_id, size, reason, margin_mode):
                 _u = float(_p.get("unrealizedPnl",0) or 0)
                 _mk = float(_p.get("markPrice",0) or 0)
                 journal.close_trade(inst_id, _mk, reason, _u,
-                    fees=abs(float(_p.get("notional",0) or 0))*0.0012)
+                    fees=abs(float(_p.get("notional",0) or 0))*0.0012,
+                    mode="live")
                 break
     except Exception as _e: print(f"journal close err: {_e}")
     if not LIVE_TRADING_ENABLED:
