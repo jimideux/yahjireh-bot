@@ -62,7 +62,11 @@ class BloFinClient:
             await self._session.close()
 
     async def _req(self, method, path, params=None, body=None, private=False):
-        if method == "POST" and "/trade/" in path and not LIVE_TRADING_ENABLED:
+        # The guard must cover order transmission AND account mutation.
+        # "/account/" sat outside it, so set-leverage POSTs reached
+        # BloFin even with LIVE_TRADING_ENABLED=false.
+        _mutating = "/trade/" in path or "/account/" in path
+        if method == "POST" and _mutating and not LIVE_TRADING_ENABLED:
             print(f"  🚫 DRY-RUN: blocked {method} {path} (LIVE_TRADING_ENABLED=false) body={body}")
             return "DRYRUN"
         s=await self._sess(); url=BASE_URL+path
@@ -203,23 +207,34 @@ class BloFinClient:
         print(f"  [SIZE] {inst_id} contracts={contracts} est_notional=${est:.2f}")
         return contracts
 
-    async def place_tpsl(self, inst_id, side, sl_trigger, size=None):
+    async def place_tpsl(self, inst_id, side, sl_trigger, size=None,
+                         margin_mode=None):
         """Place a server-side stop-loss (TPSL). side = position side being protected.
         For a LONG position, side='long', stop triggers when price falls to sl_trigger.
         Reduce-only market close on trigger. Guarded by LIVE_TRADING_ENABLED."""
         if not LIVE_TRADING_ENABLED:
             print(f"  🚫 DRY-RUN: would place STOP for {inst_id} {side} trigger={sl_trigger} — BLOCKED")
             return "DRYRUN"
+        if margin_mode is None:
+            for _p in await self.get_positions():
+                if _p.get("instId") == inst_id:
+                    margin_mode = _p.get("marginMode")
+                    break
+        if margin_mode is None:
+            print(f"  Cannot arm stop for {inst_id}: no open position "
+                  f"to read marginMode from")
+            return None
         inst = await self.get_instrument(inst_id)
         tick = float(inst.get("tickSize","0.01"))
         # close side is opposite of position side
         close_side = "sell" if side == "long" else "buy"
         body = {
-            "instId": inst_id, "marginMode": "cross", "positionSide": "net",
+            "instId": inst_id, "marginMode": margin_mode,
+            "positionSide": "net",
             "side": close_side,
             "slTriggerPrice": round_price(sl_trigger, tick),
             "slOrderPrice": "-1",     # -1 = market order on trigger
-            "size": "-1",             # -1 = entire position
+            "size": "-1" if size is None else str(size),
             "reduceOnly": "true",
             "triggerPriceType": "mark"
         }
@@ -256,7 +271,12 @@ class BloFinClient:
         count = 0
         for o in orders:
             tid = o.get("tpslId") or o.get("algoId","")
-            if tid and await self.cancel_tpsl(inst_id, tid):
+            if not tid:
+                continue
+            res = await self.cancel_tpsl(inst_id, tid)
+            # cancel_tpsl returns the STRING "DRYRUN" when blocked.
+            # Truthiness alone would count that as a real cancel.
+            if res is True:
                 count += 1
             await asyncio.sleep(0.1)
         return count
