@@ -5,6 +5,12 @@ from exchange.blofin import BloFinClient, round_price, _headers, LIVE_TRADING_EN
 from joy import send
 from declog import log_decision
 import ownership
+import risk
+# 1.5%% of equity at risk per trade (spec maximum, chosen 2026-08-04).
+# The engine is the isolated hard-constraint layer: it sizes from risk
+# and can only ever deny or shrink what the strategy proposes.
+_risk = risk.RiskEngine(limits=risk.RiskLimits(
+    risk_pct_per_trade=0.015, risk_pct_max=0.015))
 import journal
 journal.init()
 import aiohttp
@@ -46,12 +52,15 @@ async def set_leverage(client, pair, leverage):
         print(f"Leverage error {pair}: {e}")
         return False
 
-async def execute_entry(client, signal, equity):
+async def execute_entry(client, signal, equity, margin_override=None):
     pair      = signal["pair"]
     direction = signal["direction"]
     price     = await client.get_mark_price(pair)
     if price <= 0: return None
-    margin    = round(equity * config.trend_margin_pct, 2)
+    # Risk-sized margin from the gate; the old pct-of-equity path
+    # remains only as a fallback for direct callers.
+    margin    = margin_override if margin_override is not None \
+                else round(equity * config.trend_margin_pct, 2)
     notional  = margin * config.trend_leverage
     inst      = await client.get_instrument(pair)
     cv        = float(inst.get("contractValue","1") or 1)
@@ -154,6 +163,7 @@ async def scan(client, state):
         print(f"  [TREND] {len(occupied)} slots full")
         return
     equity = await client.get_equity()
+    _risk.roll_day_if_needed(equity)
     print(f"[TREND] Scan | equity=${equity:.2f} | slots={slots}")
     new_count = 0
     # Entry eligibility is NOT the same question as slot accounting.
@@ -193,7 +203,35 @@ async def scan(client, state):
                      {"ema20": signal.get("ema20"), "ema50": signal.get("ema50"),
                       "dist_pct": signal.get("dist_pct"), "vol_ratio": signal.get("vol_ratio"),
                       "equity": round(equity,2)})
-        margin    = round(equity * config.trend_margin_pct, 2)
+        # ---- risk gate: the strategy proposes, the engine disposes ----
+        atr = await client.get_atr(pair, period=config.atr_period,
+                                   bar=config.atr_bar)
+        px  = float(signal.get("price") or 0) or await client.get_mark_price(pair)
+        if atr <= 0 or px <= 0:
+            print(f"  [TREND] {pair}: no ATR/price - skipping")
+            continue
+        sl_dist = atr * config.atr_sl_mult
+        tp_dist = max(atr * config.atr_tp_mult, px * config.min_tp_pct)
+        if signal["direction"] == "long":
+            stop_px, tgt_px = px - sl_dist, px + tp_dist
+        else:
+            stop_px, tgt_px = px + sl_dist, px - tp_dist
+        open_pos = [{"pair": p.get("instId",""),
+                     "side": "long" if float(p.get("positions",0) or 0) > 0 else "short",
+                     "notional": abs(float(p.get("notional",0) or 0))}
+                    for p in positions if ownership.is_owned(p.get("instId",""))]
+        dec = _risk.evaluate_entry(
+            pair=pair, side=signal["direction"], entry_price=px,
+            stop_price=stop_px, equity=equity, target_price=tgt_px,
+            atr_pct=atr / px, open_positions=open_pos)
+        if not dec.allowed:
+            print(f"  [TREND] {pair}: risk denied - {dec.reason} {dec.detail}")
+            log_decision(pair, "denied:" + dec.reason, px,
+                         {"equity": round(equity, 2)})
+            continue
+        for w in dec.warnings:
+            print(f"  [TREND] {pair}: risk warning - {w}")
+        margin    = round(dec.notional / config.trend_leverage, 2)
         await send(
             f"🎯 <b>Trend Signal!</b>\n"
             f"{emoji} <b>{pair}</b> {direction}\n"
@@ -202,7 +240,8 @@ async def scan(client, state):
             f"📏 Dist: {signal['dist_pct']}% | Vol: {signal['vol_ratio']}x\n"
             f"💰 Margin: ${margin} @ {config.trend_leverage}x\n"
             f"⚡ Executing...")
-        trade = await execute_entry(client, signal, equity)
+        trade = await execute_entry(client, signal, equity,
+                                    margin_override=margin)
         if trade == "DRYRUN":
             print(f"  [DRY-RUN] {pair} {direction} logged, not traded")
             try:
@@ -213,6 +252,7 @@ async def scan(client, state):
                     sig=signal, equity=equity)
             except Exception as _e: print(f"journal err: {_e}")
             state["cooldowns"][pair] = time.time() + 3600
+            _risk.record_entry()  # dry entries hit the same rate caps
             slots -= 1; new_count += 1
             continue
         if trade:
@@ -223,6 +263,7 @@ async def scan(client, state):
                     sig=signal, equity=equity)
             except Exception as _e: print(f"journal err: {_e}")
             state["open_trades"].append(trade)
+            _risk.record_entry()  # live
             slots -= 1
             new_count += 1
             await send(

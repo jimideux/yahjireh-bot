@@ -158,7 +158,7 @@ async def close_market(client, inst_id, size, reason, margin_mode):
         print(f"  Market close error {inst_id}: {e}")
     return False
 
-def get_trailing_sl(entry, mark, tp_price, is_long):
+def get_trailing_sl(entry, mark, tp_price, is_long, sl_price):
     tp_dist  = (tp_price - entry) if is_long else (entry - tp_price)
     progress = ((mark - entry) / tp_dist) if is_long else ((entry - mark) / tp_dist)
     progress = max(0.0, min(1.0, progress))
@@ -171,7 +171,10 @@ def get_trailing_sl(entry, mark, tp_price, is_long):
             if c < mark: return c, "trail-75%"
         if progress >= 0.50:
             if entry < mark: return entry, "trail-50%"
-        return entry * (1 - config.atr_sl_mult * 0.005), "original"
+        # Was entry * (1 - atr_sl_mult * 0.005): a fixed 0.5% that
+        # ignored ATR entirely. Now the ATR stop check_position
+        # computed -- the same level the exchange stop is armed at.
+        return sl_price, "original"  # ATR stop (long)
     else:
         if progress >= 0.90:
             c = entry * (1 - 0.010)
@@ -181,7 +184,7 @@ def get_trailing_sl(entry, mark, tp_price, is_long):
             if c > mark: return c, "trail-75%"
         if progress >= 0.50:
             if entry > mark: return entry, "trail-50%"
-        return entry * (1 + config.atr_sl_mult * 0.005), "original"
+        return sl_price, "original"  # ATR stop (short)
 
 async def check_position(client, pos):
     inst_id     = pos.get("instId","")
@@ -239,7 +242,7 @@ async def check_position(client, pos):
         return
 
     # Trailing SL
-    dynamic_sl, sl_type = get_trailing_sl(entry, mark, tp_price, is_long)
+    dynamic_sl, sl_type = get_trailing_sl(entry, mark, tp_price, is_long, sl_price)
     sl_hit = (is_long and mark <= dynamic_sl) or (is_short and mark >= dynamic_sl)
     if sl_hit:
         await close_market(client, inst_id, size, f"{sl_type} SL @ ${mark:.4f}", margin_mode)
