@@ -61,7 +61,8 @@ def _empty() -> Dict[str, Any]:
     return {"version": _VERSION, "positions": {}}
 
 
-def _load(path: str = REGISTRY_PATH) -> Dict[str, Any]:
+def _load(path: Optional[str] = None) -> Dict[str, Any]:
+    path = path or REGISTRY_PATH
     try:
         with open(path, "r") as fh:
             d = json.load(fh)
@@ -75,7 +76,8 @@ def _load(path: str = REGISTRY_PATH) -> Dict[str, Any]:
         return _empty()
 
 
-def _save(d: Dict[str, Any], path: str = REGISTRY_PATH) -> bool:
+def _save(d: Dict[str, Any], path: Optional[str] = None) -> bool:
+    path = path or REGISTRY_PATH
     directory = os.path.dirname(path) or "."
     try:
         os.makedirs(directory, exist_ok=True)
@@ -97,12 +99,13 @@ def _save(d: Dict[str, Any], path: str = REGISTRY_PATH) -> bool:
 
 def claim(pair: str, direction: str = "", mode: str = "live",
           entry: Optional[float] = None, order_id: str = "",
-          path: str = REGISTRY_PATH) -> bool:
+          path: Optional[str] = None) -> bool:
     """
     Record that the bot opened `pair`. Call this AFTER the exchange confirms
     the order, never before -- a claim on an order that was rejected would make
     peace.py adopt whatever happens to be open on that pair.
     """
+    path = path or REGISTRY_PATH
     pair = (pair or "").upper()
     if not pair:
         return False
@@ -117,7 +120,8 @@ def claim(pair: str, direction: str = "", mode: str = "live",
     return _save(d, path)
 
 
-def release(pair: str, reason: str = "", path: str = REGISTRY_PATH) -> bool:
+def release(pair: str, reason: str = "", path: Optional[str] = None) -> bool:
+    path = path or REGISTRY_PATH
     pair = (pair or "").upper()
     d = _load(path)
     if pair in d["positions"]:
@@ -126,8 +130,9 @@ def release(pair: str, reason: str = "", path: str = REGISTRY_PATH) -> bool:
     return False
 
 
-def is_owned(pair: str, path: str = REGISTRY_PATH) -> bool:
+def is_owned(pair: str, path: Optional[str] = None) -> bool:
     """True only if the bot holds a live claim on this pair."""
+    path = path or REGISTRY_PATH
     pair = (pair or "").upper()
     rec = _load(path)["positions"].get(pair)
     if not rec:
@@ -141,21 +146,24 @@ def is_owned(pair: str, path: str = REGISTRY_PATH) -> bool:
     return True
 
 
-def owned_pairs(path: str = REGISTRY_PATH) -> List[str]:
+def owned_pairs(path: Optional[str] = None) -> List[str]:
+    path = path or REGISTRY_PATH
     return [p for p in _load(path)["positions"] if is_owned(p, path)]
 
 
-def get(pair: str, path: str = REGISTRY_PATH) -> Optional[Dict[str, Any]]:
+def get(pair: str, path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    path = path or REGISTRY_PATH
     return _load(path)["positions"].get((pair or "").upper())
 
 
-def reconcile(open_pairs, path: str = REGISTRY_PATH) -> List[str]:
+def reconcile(open_pairs, path: Optional[str] = None) -> List[str]:
     """
     Drop claims for pairs no longer open on the exchange. Call once per loop in
     trend.py with the instIds currently returned by get_positions().
 
     Returns the list of released pairs.
     """
+    path = path or REGISTRY_PATH
     live = {(p or "").upper() for p in open_pairs}
     d = _load(path)
     released = []
@@ -174,7 +182,8 @@ def reconcile(open_pairs, path: str = REGISTRY_PATH) -> List[str]:
     return released
 
 
-def describe(path: str = REGISTRY_PATH) -> str:
+def describe(path: Optional[str] = None) -> str:
+    path = path or REGISTRY_PATH
     d = _load(path)["positions"]
     if not d:
         return "no bot-owned positions"
