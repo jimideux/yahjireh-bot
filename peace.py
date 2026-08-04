@@ -10,6 +10,12 @@ import ownership
 # ── Trailing profit lock ─────────────────────────────────────────────────────
 _profit_highs = {}  # tracks highest profit seen per position
 
+# inst_id -> {"id": tpsl_id, "trigger": float, "checked": ts}
+# In-memory only. A restart re-verifies against the exchange on the
+# next cycle, which is the correct source of truth anyway.
+_armed_stops = {}
+STOP_RECHECK_SECONDS = 60
+
 def get_trail_lock(high_watermark):
     """Swing Sniper trail: breakeven at +$20, then trail ~$15-18 behind peak.
     Lets trending winners run to $50-100 instead of banking $6.50."""
@@ -19,6 +25,49 @@ def get_trail_lock(high_watermark):
     if high_watermark >= 35:  return 20.0   # peak $35 -> lock $20
     if high_watermark >= 20:  return 0.0    # peak $20 -> breakeven (risk-free)
     return None  # not yet at target — normal SL applies
+
+async def ensure_stop(client, inst_id, side_is_long, sl_price, margin_mode):
+    """Guarantee a resting stop exists on the exchange for this position.
+
+    Returns True if a stop is known to be resting, False otherwise.
+    Never raises -- a failure here must not take down the exit engine,
+    because peace.py's own trailing logic is still protecting the
+    position while the process lives.
+    """
+    now = time.time()
+    cached = _armed_stops.get(inst_id)
+    if cached and (now - cached["checked"]) < STOP_RECHECK_SECONDS:
+        return True
+    try:
+        resting = await client.get_tpsl_orders(inst_id)
+    except Exception as e:
+        print(f"  stop check failed {inst_id}: {e}")
+        return False
+    if resting:
+        tid = resting[0].get("tpslId") or resting[0].get("algoId", "")
+        _armed_stops[inst_id] = {"id": tid, "trigger": sl_price,
+                                 "checked": now}
+        return True
+    side = "long" if side_is_long else "short"
+    try:
+        res = await client.place_tpsl(inst_id, side, sl_price,
+                                      margin_mode=margin_mode)
+    except Exception as e:
+        print(f"  stop arm error {inst_id}: {e}")
+        return False
+    if res == "DRYRUN":
+        print(f"  \U0001F6AB DRY-RUN: {inst_id} has NO exchange stop "
+              f"(would arm @ ${sl_price:.4f})")
+        return False
+    if res:
+        _armed_stops[inst_id] = {"id": res, "trigger": sl_price,
+                                 "checked": now}
+        await send(f"\U0001F6E1 <b>Stop Armed</b>\n"
+                   f"\U0001F4CC {inst_id}\n"
+                   f"\U0001F6D1 Trigger: ${sl_price:.4f}")
+        return True
+    print(f"  \u26A0\uFE0F  {inst_id} UNPROTECTED - stop could not be armed")
+    return False
 
 async def place_tp_order(inst_id, side, price, size, margin_mode, tick):
     if not LIVE_TRADING_ENABLED:
@@ -74,7 +123,9 @@ async def close_market(client, inst_id, size, reason, margin_mode):
         print(f"  🚫 DRY-RUN peace: would CLOSE {inst_id} ({reason}) — BLOCKED")
         return "DRYRUN"
     try:
+        await client.cancel_all_tpsl(inst_id)
         await client.cancel_all_orders(inst_id)
+        _armed_stops.pop(inst_id, None)
         await asyncio.sleep(0.3)
         side = "sell" if size > 0 else "buy"
         abs_size = abs(size)
@@ -196,6 +247,10 @@ async def check_position(client, pos):
 
     if sl_type != "original":
         print(f"  {inst_id} [{sl_type}] sl=${dynamic_sl:.4f} mark=${mark:.4f} uPnL=${upnl:.2f}")
+
+    # Arm a resting stop on the exchange. This is the backstop for
+    # process death; the trailing logic above handles the live case.
+    await ensure_stop(client, inst_id, is_long, sl_price, margin_mode)
 
     # Check and place TP order
     orders    = await client.get_pending_orders(inst_id)
