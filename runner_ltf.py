@@ -45,7 +45,7 @@ from ltf_signals import LTFScanner, LTFConfig, normalize_candles
 # Knobs — this block is yours
 # ---------------------------------------------------------------------------
 
-MIN_VOL_USD_24H = 5_000_000     # liquidity floor; raise if fills feel thin
+MIN_VOL_USD_24H = 2_000_000     # liquidity floor; raise if fills feel thin
 MAX_ALERTS_PER_SWEEP = 5        # best-ranked signals per bar close
 BAR_S = 900                     # 15m bar cadence the loop aligns to
 GRACE_S = 5                     # wake this long after the boundary
