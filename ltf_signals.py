@@ -60,6 +60,9 @@ class LTFConfig:
     htf_ema_period: int = 50
     htf_slope_lookback: int = 3
     htf_min_slope_pct: float = 0.002  # above daily-noise floor; see htf_filter.py
+    require_closed_bar: bool = True   # drop the still-forming candle (confirm=0)
+                                      # before scanning. Signals never repaint;
+                                      # alerts land within one sweep of bar close.
 
     # --- LTF structure -----------------------------------------------------
     ltf_ema_fast: int = 20
@@ -190,12 +193,15 @@ def normalize_candles(raw) -> list:
                 "open": float(row["open"]), "high": float(row["high"]),
                 "low": float(row["low"]), "close": float(row["close"]),
                 "volume": float(row.get("volume") or row.get("vol") or 0.0),
+                "confirm": int(float(row.get("confirm", 1))),
             })
         else:
             out.append({
                 "ts": float(row[0]), "open": float(row[1]), "high": float(row[2]),
                 "low": float(row[3]), "close": float(row[4]),
                 "volume": float(row[5]) if len(row) > 5 else 0.0,
+                # BloFin col 9: '1' = candle closed, '0' = still forming
+                "confirm": int(float(row[8])) if len(row) > 8 else 1,
             })
     out.sort(key=lambda c: c["ts"])
     return out
@@ -359,6 +365,13 @@ class LTFScanner:
         """Return a Signal or None. Pure — does not mutate alert state."""
         cfg = self.cfg
         now = now or time.time()
+
+        if cfg.require_closed_bar:
+            # never judge a bar that's still being painted
+            while ltf_candles and ltf_candles[-1].get("confirm", 1) == 0:
+                ltf_candles = ltf_candles[:-1]
+            while htf_candles and htf_candles[-1].get("confirm", 1) == 0:
+                htf_candles = htf_candles[:-1]
 
         need = max(cfg.ltf_ema_slow, cfg.atr_period, cfg.rsi_period) + cfg.swing_lookback + 5
         if len(ltf_candles) < need or len(htf_candles) < cfg.htf_ema_period + 5:
