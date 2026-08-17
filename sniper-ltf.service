@@ -1,0 +1,14 @@
+[Unit]
+Description=YahJireh LTF telegram alerts (read-only: candles + telegram, no order paths)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/trading
+Environment=ENV_FILE=/root/trading/.env.live
+ExecStart=/root/trading/.venv/bin/python3 /root/trading/runner_ltf.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
