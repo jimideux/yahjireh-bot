@@ -13,3 +13,4 @@ trend_state.json
 risk_state.json
 
 ltf_alerts.json
+ltf_exec_*.json

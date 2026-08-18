@@ -1,0 +1,14 @@
+[Unit]
+Description=YahJireh LTF executor (dry-run until LIVE_TRADING_ENABLED — five-guard stack decides, not this file)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/trading
+Environment=ENV_FILE=/root/trading/.env.live
+ExecStart=/root/trading/.venv/bin/python3 /root/trading/ltf_executor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
