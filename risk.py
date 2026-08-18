@@ -1,465 +1,787 @@
+#!/usr/bin/env python3
 """
-risk.py — YahJireh isolated risk engine (hard constraint layer).
+risk.py -- YahJireh isolated hard-constraint risk layer.
 
-Pure logic. No network, no exchange client, no imports from the trading stack.
-Decisions in, verdicts out. That isolation is deliberate: this module must stay
-correct even if trend.py / peace.py / blofin.py are mid-refactor.
+DESIGN CONTRACT
+---------------
+1. This module is a PURE FUNCTION of (inputs, persisted state). It imports
+   nothing outside the stdlib and knows nothing about BloFin, love.py,
+   journal.py, or any strategy. It cannot be broken by changes to those.
+2. No caller may override a denial. `RiskDecision.allowed == False` is final.
+   There is deliberately no `force=True` parameter anywhere in this file.
+3. Sizing is returned, never requested. The strategy proposes an entry and a
+   stop; the risk layer decides how much notional (if any) is permitted.
 
-DESIGN RULE: there is no override argument anywhere in this file. If evaluate_entry
-returns allow=False, the answer is no. Callers may log the refusal. They may not
-bypass it. If you find yourself adding a `force=True` kwarg, that is the bug.
+WHY SIZING AND NOT set-leverage
+-------------------------------
+BloFin returns 152404 on /api/v1/account/set-leverage for this account, so
+per-asset leverage caps CANNOT be enforced exchange-side. They are enforced
+here by capping notional: effective_leverage = notional / equity. If the
+account default leverage is higher than the cap, the position is still safe
+because the notional is small enough that the risk is bounded.
 
-State persists to JSON so it survives the `Restart=always` systemd cycle.
-
-Integration is three calls — see wire_in() docstring at the bottom.
+STATE
+-----
+Persisted to risk_state.json (add to .gitignore). Survives service restarts,
+which matters: a restart must not reset the daily drawdown counter or the
+consecutive-loss breaker.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
+import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional, Sequence
 
-STATE_PATH = os.getenv("RISK_STATE", "/root/trading/risk_state.json")
-
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class RiskConfig:
-    """Defaults mirror love.py where an equivalent exists, and are tightened to
-    the stricter of (your value, spec value) where both specify one."""
-
-    # --- per-trade sizing --------------------------------------------------
-    max_risk_pct_per_trade: float = 0.015          # spec: 1-1.5% equity at risk
-    max_leverage_default: int = 3                  # love.trend_leverage
-    max_leverage_by_asset: dict = field(default_factory=lambda: {
-        "BTC-USDT": 5, "ETH-USDT": 5,
-        "SOL-USDT": 3, "XRP-USDT": 3,
-        "LINK-USDT": 3, "SUI-USDT": 2,
-    })
-
-    # --- portfolio ---------------------------------------------------------
-    max_concurrent_positions: int = 2              # love.trend_max_slots
-    max_total_exposure_pct: float = 0.95
-    # ^ Sized to admit your current config, NOT chosen on merit.
-    #   love.py: trend_margin_pct 0.15 x trend_leverage 3 = 45% notional/trade.
-    #   trend_max_slots 2 => 90% notional at full allocation.
-    #   Anything below 0.90 silently blocks your second slot forever, which
-    #   would look like a signal-frequency bug rather than a risk block.
-    #   If you'd rather cap real exposure, lower trend_margin_pct in love.py
-    #   and lower this to match — do not leave the two out of sync.
-    max_positions_per_cluster: int = 1
-    clusters: dict = field(default_factory=lambda: {
-        "BTC-USDT": "majors",   "ETH-USDT": "majors",
-        "SOL-USDT": "l1alt",    "SUI-USDT": "l1alt",
-        "XRP-USDT": "payments", "LINK-USDT": "infra",
-    })
-
-    # --- drawdown / circuit breakers --------------------------------------
-    max_daily_dd_pct: float = 0.04                 # love.max_dd_pct (spec said 5%)
-    max_daily_loss_usd: float = 20.0               # love.max_loss_usd
-    consecutive_loss_limit: int = 3                # spec
-    cooldown_after_loss_streak_s: int = 6 * 3600
-    cooldown_after_close_s: int = 300              # love.cooldown_after_close_s
-
-    # --- liquidation safety ------------------------------------------------
-    min_liq_buffer_pct: float = 0.20               # spec: 20% from liq price
-
-    # --- fee gate (not in spec; added from your audit) ---------------------
-    fee_round_trip: float = 0.0012                 # your backtest assumption
-    min_tp_to_fee_ratio: float = 8.0
-    min_expected_value_pct: float = 0.0
-
-    # --- failure-mode detection -------------------------------------------
-    overtrade_window_s: int = 24 * 3600
-    overtrade_max_trades: int = 6
-    revenge_window_s: int = 900                    # new entry <15m after a loss
-    funding_bleed_window_s: int = 24 * 3600
-    funding_bleed_max_usd: float = 5.0
-    vol_spike_atr_pct_max: float = 0.06            # ATR/price above this = no-trade
+__all__ = ["RiskLimits", "RiskDecision", "RiskEngine", "CORRELATION_GROUPS"]
 
 
 # ---------------------------------------------------------------------------
-# Verdict
+# Correlation grouping
+# ---------------------------------------------------------------------------
+# A static group map beats a runtime Pearson correlation computed on 30 candles.
+# Short-window correlation estimates are dominated by sampling error, and in a
+# crash *everything* goes to 1.0 anyway -- which is precisely when you need the
+# constraint to hold. Static groups encode that prior explicitly.
+
+CORRELATION_GROUPS: Dict[str, set] = {
+    "majors": {"BTC-USDT", "ETH-USDT"},
+    "l1": {"SOL-USDT", "AVAX-USDT", "ADA-USDT", "DOT-USDT", "NEAR-USDT",
+           "APT-USDT", "SUI-USDT", "SEI-USDT", "TON-USDT"},
+    "payments": {"XRP-USDT", "XLM-USDT", "LTC-USDT", "BCH-USDT"},
+    "defi": {"UNI-USDT", "AAVE-USDT", "LINK-USDT", "MKR-USDT", "CRV-USDT"},
+    "meme": {"DOGE-USDT", "SHIB-USDT", "PEPE-USDT", "WIF-USDT", "BONK-USDT"},
+    "privacy": {"ZEC-USDT", "XMR-USDT", "DASH-USDT"},
+}
+
+
+def group_of(pair: str) -> str:
+    """Return the correlation group for a pair, or the pair itself if ungrouped."""
+    p = pair.upper()
+    for name, members in CORRELATION_GROUPS.items():
+        if p in members:
+            return name
+    return f"_ungrouped:{p}"
+
+
+# ---------------------------------------------------------------------------
+# Limits
 # ---------------------------------------------------------------------------
 
 @dataclass
-class Verdict:
-    allow: bool
-    reasons: list = field(default_factory=list)
-    max_notional: float = 0.0
-    max_leverage: int = 0
+class RiskLimits:
+    """All hard constraints. Every value is a ceiling, never a target."""
+
+    # --- per-trade sizing ---
+    risk_pct_per_trade: float = 0.010      # 1.0% of equity at risk per trade
+    risk_pct_max: float = 0.015            # absolute ceiling, 1.5%
+
+    # --- daily / account ---
+    max_daily_drawdown_pct: float = 0.05   # 5% from the day's anchor equity
+    max_total_drawdown_pct: float = 0.20   # 20% from all-time peak equity
+    min_equity_floor: float = 0.0          # absolute USDT floor; 0 disables
+
+    # --- loss streak ---
+    consecutive_loss_limit: int = 3
+    cooldown_minutes_after_streak: int = 240
+
+    # --- leverage / exposure ---
+    max_effective_leverage: float = 5.0    # notional / equity, per position
+    max_leverage_by_group: Dict[str, float] = field(default_factory=lambda: {
+        "majors": 5.0,
+        "l1": 4.0,
+        "payments": 4.0,
+        "defi": 3.0,
+        "meme": 2.0,
+        "privacy": 2.0,
+    })
+    max_portfolio_exposure_pct: float = 3.0   # sum(notional) / equity
+    max_group_exposure_pct: float = 1.5       # sum(notional in group) / equity
+    max_concurrent_positions: int = 4
+    max_positions_per_group: int = 2
+
+    # --- liquidation safety ---
+    liq_buffer_pct: float = 0.20           # stop must sit >=20% of the
+                                           # entry->liq distance away from liq
+    default_mmr: float = 0.005             # maintenance margin rate fallback
+
+    # --- volatility regime ---
+    atr_pct_ceiling: float = 0.08          # 8% ATR/price -> no-trade mode
+    atr_pct_floor: float = 0.002           # 0.2% -> too dead, spread dominates
+
+    # --- stop sanity ---
+    min_stop_distance_pct: float = 0.003   # below this, fees dominate the risk
+    max_stop_distance_pct: float = 0.12    # above this, sizing gets nonsensical
+
+    # --- overtrading / failure modes ---
+    max_trades_per_hour: int = 3
+    max_trades_per_day: int = 12
+    max_funding_bleed_pct_per_day: float = 0.005   # 0.5% of equity
+
+    # --- fee awareness ---
+    taker_fee_pct: float = 0.0006          # BloFin taker, one side
+    min_rr_after_fees: float = 1.5         # reject setups that aren't worth it
+
+    def leverage_cap_for(self, pair: str) -> float:
+        return min(
+            self.max_effective_leverage,
+            self.max_leverage_by_group.get(group_of(pair), self.max_effective_leverage),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Decision
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RiskDecision:
+    allowed: bool
+    reason: str = "ok"
+    notional: float = 0.0          # USDT notional permitted
+    qty: float = 0.0               # base-asset quantity (notional / entry)
+    margin: float = 0.0            # notional / effective leverage
+    risk_amount: float = 0.0       # USDT lost if the stop fills exactly
+    effective_leverage: float = 0.0
+    warnings: List[str] = field(default_factory=list)
+    detail: Dict[str, Any] = field(default_factory=dict)
 
     def __bool__(self) -> bool:
-        return self.allow
+        return self.allowed
 
-    def __str__(self) -> str:
-        head = "ALLOW" if self.allow else "BLOCK"
-        if not self.reasons:
-            return head
-        return f"{head}: " + "; ".join(self.reasons)
+    @staticmethod
+    def deny(reason: str, **detail) -> "RiskDecision":
+        return RiskDecision(allowed=False, reason=reason, detail=detail)
 
 
 # ---------------------------------------------------------------------------
-# Position view — what the caller must supply
+# Math helpers (pure, independently testable)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class OpenPosition:
-    pair: str
-    side: str            # "long" | "short"
-    notional: float
-    entry_price: float
-    liq_price: Optional[float] = None
-    mark_price: Optional[float] = None
+def liq_distance_pct(leverage: float, mmr: float) -> float:
+    """
+    Approximate fractional distance from entry to liquidation, isolated margin.
+
+        long  liq ~= entry * (1 - 1/L + mmr)
+        short liq ~= entry * (1 + 1/L - mmr)
+
+    Magnitude is symmetric, so one function serves both sides. This IGNORES
+    fees and funding accrued against the position, so it is slightly optimistic
+    -- always prefer the exchange-reported liquidation price when you have it.
+    """
+    if leverage <= 0:
+        return 0.0
+    return max(0.0, (1.0 / leverage) - mmr)
+
+
+def stop_distance_pct(entry: float, stop: float) -> float:
+    if entry <= 0:
+        return 0.0
+    return abs(entry - stop) / entry
+
+
+def rr_after_fees(entry: float, stop: float, target: float,
+                  taker_fee_pct: float) -> float:
+    """
+    Reward:risk net of a taker round trip on both legs.
+    Fees are charged on notional, so they scale out of the ratio as
+    2 * fee / stop_distance -- which is exactly why tight stops are expensive.
+    """
+    sd = stop_distance_pct(entry, stop)
+    td = stop_distance_pct(entry, target)
+    if sd <= 0:
+        return 0.0
+    round_trip = 2.0 * taker_fee_pct
+    net_reward = td - round_trip
+    net_risk = sd + round_trip
+    if net_risk <= 0:
+        return 0.0
+    return net_reward / net_risk
+
+
+def _utc_day_key(ts: Optional[float] = None) -> str:
+    dt = datetime.fromtimestamp(ts if ts is not None else time.time(), tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d")
 
 
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
 
-class RiskManager:
+class RiskEngine:
+    """
+    Stateful risk gate. One instance per process. Safe to construct in both
+    trend.py (entry decisions) and a monitoring process (read-only checks),
+    though only one process should call record_close().
+    """
 
-    def __init__(self, cfg: Optional[RiskConfig] = None, state_path: str = STATE_PATH):
-        self.cfg = cfg or RiskConfig()
+    STATE_VERSION = 1
+
+    def __init__(self,
+                 limits: Optional[RiskLimits] = None,
+                 state_path: str = "/root/trading/risk_state.json",
+                 pause_flag_path: str = "/root/trading/PAUSED"):
+        self.limits = limits or RiskLimits()
         self.state_path = state_path
-        self.state = self._load()
+        self.pause_flag_path = pause_flag_path
+        self.state = self._load_state()
 
-    # -- persistence --------------------------------------------------------
+    # -- persistence ---------------------------------------------------------
 
-    def _blank_state(self) -> dict:
+    def _default_state(self) -> Dict[str, Any]:
         return {
-            "day_key": self._day_key(),
-            "day_start_equity": None,
+            "version": self.STATE_VERSION,
+            "day_key": _utc_day_key(),
+            "day_anchor_equity": 0.0,
             "day_realized_pnl": 0.0,
             "day_funding_paid": 0.0,
+            "day_trade_count": 0,
+            "peak_equity": 0.0,
             "consecutive_losses": 0,
-            "last_close_ts": 0.0,
-            "last_loss_ts": 0.0,
             "cooldown_until": 0.0,
-            "halt_reason": None,
-            "closes": [],          # [{ts, pnl, pair}] rolling, trimmed to 48h
+            "recent_entry_ts": [],
+            "halted": False,
+            "halt_reason": "",
         }
 
-    def _load(self) -> dict:
+    def _load_state(self) -> Dict[str, Any]:
         try:
-            with open(self.state_path) as fh:
-                st = json.load(fh)
-            for k, v in self._blank_state().items():
-                st.setdefault(k, v)
-            return st
-        except (FileNotFoundError, json.JSONDecodeError):
-            return self._blank_state()
+            with open(self.state_path, "r") as fh:
+                s = json.load(fh)
+            if s.get("version") != self.STATE_VERSION:
+                base = self._default_state()
+                base.update({k: v for k, v in s.items() if k in base})
+                base["version"] = self.STATE_VERSION
+                return base
+            return s
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return self._default_state()
 
-    def save(self) -> None:
-        tmp = f"{self.state_path}.tmp"
-        with open(tmp, "w") as fh:
-            json.dump(self.state, fh, indent=2)
-        os.replace(tmp, self.state_path)
+    def _save_state(self) -> None:
+        """Atomic write. A torn risk_state.json would silently reset the breaker."""
+        d = os.path.dirname(self.state_path) or "."
+        try:
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".risk_state.", suffix=".tmp")
+            with os.fdopen(fd, "w") as fh:
+                json.dump(self.state, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.state_path)
+        except OSError as exc:
+            # Never let a disk problem crash the trading loop, but make it loud.
+            print(f"[risk] WARN could not persist state: {exc}")
 
-    # -- day handling -------------------------------------------------------
+    # -- lifecycle -----------------------------------------------------------
 
-    @staticmethod
-    def _day_key(ts: Optional[float] = None) -> str:
-        dt = datetime.fromtimestamp(ts or time.time(), tz=timezone.utc)
-        return dt.strftime("%Y-%m-%d")
+    def roll_day_if_needed(self, equity: float, now: Optional[float] = None) -> None:
+        """Call once per loop before evaluate_entry(). Anchors the daily DD."""
+        key = _utc_day_key(now)
+        if self.state["day_key"] != key or self.state["day_anchor_equity"] <= 0:
+            self.state.update({
+                "day_key": key,
+                "day_anchor_equity": equity,
+                "day_realized_pnl": 0.0,
+                "day_funding_paid": 0.0,
+                "day_trade_count": 0,
+                "recent_entry_ts": [],
+            })
+            # A new day clears the daily halt, but NOT the loss streak --
+            # a 3-loss streak at 23:58 UTC is still a 3-loss streak at 00:02.
+            if self.state.get("halt_reason", "").startswith("daily_"):
+                self.state["halted"] = False
+                self.state["halt_reason"] = ""
+            self._save_state()
 
-    def roll_day_if_needed(self, equity: float, now: Optional[float] = None) -> bool:
-        """Reset daily counters at UTC midnight. Returns True if a roll happened."""
-        now = now or time.time()
-        key = self._day_key(now)
-        if self.state["day_key"] == key and self.state["day_start_equity"] is not None:
-            return False
-        self.state["day_key"] = key
-        self.state["day_start_equity"] = equity
-        self.state["day_realized_pnl"] = 0.0
-        self.state["day_funding_paid"] = 0.0
-        # A daily-DD halt clears at rollover. A loss-streak cooldown does not.
-        if self.state["halt_reason"] in ("daily_drawdown", "daily_loss_usd"):
-            self.state["halt_reason"] = None
-        self.save()
-        return True
+        if equity > self.state["peak_equity"]:
+            self.state["peak_equity"] = equity
+            self._save_state()
 
-    # -- helpers ------------------------------------------------------------
+    def record_entry(self, now: Optional[float] = None) -> None:
+        now = now if now is not None else time.time()
+        self.state["recent_entry_ts"].append(now)
+        cutoff = now - 3600.0
+        self.state["recent_entry_ts"] = [
+            t for t in self.state["recent_entry_ts"] if t >= cutoff
+        ]
+        self.state["day_trade_count"] += 1
+        self._save_state()
 
-    def expected_value_pct(self, win_rate: float, tp_pct: float, sl_pct: float) -> float:
-        """Per-trade EV as a fraction of notional, fees included both sides.
-
-        Worth running before any parameter change. At your backtested numbers:
-            43.5% / 2.5% / 1.0%  ->  +0.402%   (the 4H + daily-filter config)
-            33.3% / 2.5% / 1.0%  ->  +0.035%   (the 1H config — barely alive)
-            32.0% / 0.3% / 0.2%  ->  -0.062%   (scalper-shaped params — dead)
-        The gap between rows 2 and 3 is where the -$16k went.
-        """
-        f = self.cfg.fee_round_trip
-        return win_rate * (tp_pct - f) - (1.0 - win_rate) * (sl_pct + f)
-
-    def _trim_closes(self, now: float) -> None:
-        horizon = now - max(self.cfg.overtrade_window_s, self.cfg.funding_bleed_window_s) * 2
-        self.state["closes"] = [c for c in self.state["closes"] if c["ts"] >= horizon]
-
-    def _closes_within(self, window_s: int, now: float) -> list:
-        return [c for c in self.state["closes"] if c["ts"] >= now - window_s]
-
-    # -- the gate -----------------------------------------------------------
-
-    def evaluate_entry(
-        self,
-        *,
-        pair: str,
-        side: str,
-        equity: float,
-        proposed_notional: float,
-        proposed_leverage: int,
-        entry_price: float,
-        stop_price: float,
-        tp_price: float,
-        open_positions: list,
-        atr: Optional[float] = None,
-        now: Optional[float] = None,
-    ) -> Verdict:
-        """Single decision point. Every entry path must route through this."""
-        now = now or time.time()
-        cfg = self.cfg
-        reasons: list = []
-
-        self.roll_day_if_needed(equity, now)
-        self._trim_closes(now)
-
-        # 1. standing halt -------------------------------------------------
-        if self.state["halt_reason"]:
-            reasons.append(f"halted: {self.state['halt_reason']}")
-
-        # 2. cooldowns ------------------------------------------------------
-        if now < self.state["cooldown_until"]:
-            left = int(self.state["cooldown_until"] - now)
-            reasons.append(f"cooldown active ({left}s left)")
-        if now - self.state["last_close_ts"] < cfg.cooldown_after_close_s:
-            left = int(cfg.cooldown_after_close_s - (now - self.state["last_close_ts"]))
-            reasons.append(f"post-close cooldown ({left}s left)")
-
-        # 3. daily drawdown -------------------------------------------------
-        start_eq = self.state["day_start_equity"] or equity
-        if start_eq > 0:
-            dd = (start_eq - equity) / start_eq
-            if dd >= cfg.max_daily_dd_pct:
-                reasons.append(f"daily drawdown {dd:.2%} >= {cfg.max_daily_dd_pct:.2%}")
-                self.state["halt_reason"] = "daily_drawdown"
-        if -self.state["day_realized_pnl"] >= cfg.max_daily_loss_usd:
-            reasons.append(f"daily realized loss ${-self.state['day_realized_pnl']:.2f}")
-            self.state["halt_reason"] = "daily_loss_usd"
-
-        # 4. loss streak ----------------------------------------------------
-        if self.state["consecutive_losses"] >= cfg.consecutive_loss_limit:
-            reasons.append(f"{self.state['consecutive_losses']} consecutive losses")
-
-        # 5. slot / exposure / cluster --------------------------------------
-        if len(open_positions) >= cfg.max_concurrent_positions:
-            reasons.append(f"slots full ({len(open_positions)}/{cfg.max_concurrent_positions})")
-
-        exposure = sum(p.notional for p in open_positions) + proposed_notional
-        if equity > 0 and exposure / equity > cfg.max_total_exposure_pct:
-            reasons.append(
-                f"total exposure {exposure / equity:.1%} > {cfg.max_total_exposure_pct:.0%}")
-
-        cluster = cfg.clusters.get(pair)
-        if cluster:
-            same = sum(1 for p in open_positions if cfg.clusters.get(p.pair) == cluster)
-            if same >= cfg.max_positions_per_cluster:
-                reasons.append(f"cluster '{cluster}' already has {same} position(s)")
-
-        if any(p.pair == pair for p in open_positions):
-            reasons.append(f"already in {pair}")
-
-        # 6. leverage cap ---------------------------------------------------
-        lev_cap = cfg.max_leverage_by_asset.get(pair, cfg.max_leverage_default)
-        if proposed_leverage > lev_cap:
-            reasons.append(f"leverage {proposed_leverage}x > cap {lev_cap}x for {pair}")
-
-        # 7. per-trade risk -------------------------------------------------
-        if entry_price <= 0:
-            reasons.append("invalid entry price")
-        else:
-            sl_frac = abs(entry_price - stop_price) / entry_price
-            risk_usd = proposed_notional * sl_frac
-            if equity > 0 and risk_usd / equity > cfg.max_risk_pct_per_trade:
-                reasons.append(
-                    f"trade risk {risk_usd / equity:.2%} > {cfg.max_risk_pct_per_trade:.2%}")
-
-            # 8. fee gate ---------------------------------------------------
-            tp_frac = abs(tp_price - entry_price) / entry_price
-            if tp_frac < cfg.fee_round_trip * cfg.min_tp_to_fee_ratio:
-                reasons.append(
-                    f"TP {tp_frac:.3%} < {cfg.min_tp_to_fee_ratio:.0f}x round-trip fees "
-                    f"({cfg.fee_round_trip * cfg.min_tp_to_fee_ratio:.3%}) — fee-dominated")
-
-        # 9. stop direction sanity ------------------------------------------
-        s = side.lower()
-        if s in ("long", "buy"):
-            if stop_price >= entry_price or tp_price <= entry_price:
-                reasons.append("long: stop must sit below entry and TP above")
-        elif s in ("short", "sell"):
-            if stop_price <= entry_price or tp_price >= entry_price:
-                reasons.append("short: stop must sit above entry and TP below")
-        else:
-            reasons.append(f"unknown side '{side}'")
-
-        # 10. volatility spike ----------------------------------------------
-        if atr is not None and entry_price > 0:
-            atr_pct = atr / entry_price
-            if atr_pct > cfg.vol_spike_atr_pct_max:
-                reasons.append(f"ATR {atr_pct:.2%} > spike ceiling "
-                               f"{cfg.vol_spike_atr_pct_max:.2%}")
-
-        # 11. failure modes --------------------------------------------------
-        reasons.extend(self.detect_failure_modes(now))
-
-        allow = not reasons
-        max_notional = 0.0
-        if allow and entry_price > 0:
-            sl_frac = abs(entry_price - stop_price) / entry_price
-            if sl_frac > 0:
-                max_notional = (equity * cfg.max_risk_pct_per_trade) / sl_frac
-
-        self.save()
-        return Verdict(allow=allow, reasons=reasons,
-                       max_notional=max_notional,
-                       max_leverage=lev_cap)
-
-    # -- failure-mode detection ---------------------------------------------
-
-    def detect_failure_modes(self, now: Optional[float] = None) -> list:
-        now = now or time.time()
-        cfg = self.cfg
-        out = []
-
-        recent = self._closes_within(cfg.overtrade_window_s, now)
-        if len(recent) > cfg.overtrade_max_trades:
-            out.append(f"overtrading: {len(recent)} closes in "
-                       f"{cfg.overtrade_window_s // 3600}h")
-
-        if self.state["last_loss_ts"] and (now - self.state["last_loss_ts"]) < cfg.revenge_window_s:
-            out.append(f"revenge window: last loss "
-                       f"{int(now - self.state['last_loss_ts'])}s ago")
-
-        if self.state["day_funding_paid"] > cfg.funding_bleed_max_usd:
-            out.append(f"funding bleed ${self.state['day_funding_paid']:.2f} today")
-
-        return out
-
-    # -- liquidation buffer (call from peace.py on each poll) ---------------
-
-    def liquidation_buffer_ok(self, pos: OpenPosition) -> Verdict:
-        if not pos.liq_price or not pos.mark_price or pos.mark_price <= 0:
-            return Verdict(allow=True, reasons=["liq/mark price unavailable"])
-        buf = abs(pos.mark_price - pos.liq_price) / pos.mark_price
-        if buf < self.cfg.min_liq_buffer_pct:
-            return Verdict(allow=False, reasons=[
-                f"{pos.pair} liq buffer {buf:.1%} < {self.cfg.min_liq_buffer_pct:.0%}"])
-        return Verdict(allow=True)
-
-    # -- outcome recording ---------------------------------------------------
-
-    def record_close(self, *, pair: str, net_pnl: float, equity_after: float,
-                     funding_paid: float = 0.0, now: Optional[float] = None) -> None:
-        """Call once per closed trade, after fees. peace.py exit path."""
-        now = now or time.time()
-        self.roll_day_if_needed(equity_after, now)
-
-        self.state["closes"].append({"ts": now, "pnl": net_pnl, "pair": pair})
+    def record_close(self, net_pnl: float, equity_after: float,
+                     now: Optional[float] = None) -> None:
+        """Call from the exit path with the realised net PnL of one position."""
+        now = now if now is not None else time.time()
         self.state["day_realized_pnl"] += net_pnl
-        self.state["day_funding_paid"] += funding_paid
-        self.state["last_close_ts"] = now
 
         if net_pnl < 0:
             self.state["consecutive_losses"] += 1
-            self.state["last_loss_ts"] = now
-            if self.state["consecutive_losses"] >= self.cfg.consecutive_loss_limit:
-                self.state["cooldown_until"] = now + self.cfg.cooldown_after_loss_streak_s
+            if self.state["consecutive_losses"] >= self.limits.consecutive_loss_limit:
+                self.state["cooldown_until"] = now + self.limits.cooldown_minutes_after_streak * 60.0
         else:
             self.state["consecutive_losses"] = 0
 
-        self._trim_closes(now)
-        self.save()
+        if equity_after > self.state["peak_equity"]:
+            self.state["peak_equity"] = equity_after
+        self._save_state()
 
-    def record_funding(self, amount_usd: float) -> None:
-        self.state["day_funding_paid"] += max(0.0, amount_usd)
-        self.save()
-
-    # -- manual controls -----------------------------------------------------
+    def record_funding(self, amount_paid: float) -> None:
+        """Positive amount = funding cost paid out."""
+        self.state["day_funding_paid"] += max(0.0, amount_paid)
+        self._save_state()
 
     def halt(self, reason: str) -> None:
+        self.state["halted"] = True
         self.state["halt_reason"] = reason
-        self.save()
+        self._save_state()
 
-    def clear_halt(self, acknowledge: str) -> bool:
-        """Requires the literal string 'I have reviewed the cause'. Deliberate friction."""
-        if acknowledge.strip() != "I have reviewed the cause":
-            return False
-        self.state["halt_reason"] = None
-        self.state["consecutive_losses"] = 0
-        self.state["cooldown_until"] = 0.0
-        self.save()
-        return True
+    def clear_halt(self) -> None:
+        self.state["halted"] = False
+        self.state["halt_reason"] = ""
+        self._save_state()
 
-    def status(self) -> dict:
-        now = time.time()
-        return {
-            "day": self.state["day_key"],
-            "day_start_equity": self.state["day_start_equity"],
-            "day_realized_pnl": round(self.state["day_realized_pnl"], 2),
-            "day_funding_paid": round(self.state["day_funding_paid"], 2),
-            "consecutive_losses": self.state["consecutive_losses"],
-            "halt_reason": self.state["halt_reason"],
-            "cooldown_s_left": max(0, int(self.state["cooldown_until"] - now)),
-            "closes_24h": len(self._closes_within(86400, now)),
-            "failure_modes": self.detect_failure_modes(now),
-        }
+    # -- account-level gate --------------------------------------------------
 
+    def account_status(self, equity: float, now: Optional[float] = None) -> RiskDecision:
+        """Checks that don't depend on the proposed trade. Cheap; call first."""
+        now = now if now is not None else time.time()
+        L = self.limits
 
-# ---------------------------------------------------------------------------
-# Integration notes
-# ---------------------------------------------------------------------------
+        if os.path.exists(self.pause_flag_path):
+            return RiskDecision.deny("paused_flag_present", path=self.pause_flag_path)
 
-def wire_in():
-    """
-    trend.py — immediately before the entry POST (the one at ~line 79 that
-    hardcodes openapi.blofin.com):
+        if self.state.get("halted"):
+            return RiskDecision.deny("manually_halted",
+                                     halt_reason=self.state.get("halt_reason", ""))
 
-        from risk import RiskManager, OpenPosition
-        RISK = RiskManager()
+        if L.min_equity_floor > 0 and equity <= L.min_equity_floor:
+            return RiskDecision.deny("equity_floor_breached",
+                                     equity=equity, floor=L.min_equity_floor)
 
-        v = RISK.evaluate_entry(
-            pair=pair, side=direction, equity=equity,
-            proposed_notional=notional, proposed_leverage=love.trend_leverage,
-            entry_price=px, stop_price=sl_px, tp_price=tp_px,
-            open_positions=[OpenPosition(pair=p["pair"], side=p["side"],
-                                         notional=p["notional"],
-                                         entry_price=p["entry"]) for p in open_trades],
-            atr=atr,
+        anchor = self.state["day_anchor_equity"]
+        if anchor > 0:
+            day_dd = (anchor - equity) / anchor
+            if day_dd >= L.max_daily_drawdown_pct:
+                self.halt(f"daily_drawdown:{day_dd:.4f}")
+                return RiskDecision.deny("daily_drawdown_limit",
+                                         drawdown=round(day_dd, 4),
+                                         limit=L.max_daily_drawdown_pct)
+
+        peak = self.state["peak_equity"]
+        if peak > 0:
+            total_dd = (peak - equity) / peak
+            if total_dd >= L.max_total_drawdown_pct:
+                self.halt(f"total_drawdown:{total_dd:.4f}")
+                return RiskDecision.deny("total_drawdown_limit",
+                                         drawdown=round(total_dd, 4),
+                                         limit=L.max_total_drawdown_pct)
+
+        if now < self.state.get("cooldown_until", 0.0):
+            mins = (self.state["cooldown_until"] - now) / 60.0
+            return RiskDecision.deny("loss_streak_cooldown",
+                                     minutes_remaining=round(mins, 1),
+                                     consecutive_losses=self.state["consecutive_losses"])
+
+        if self.state["consecutive_losses"] >= L.consecutive_loss_limit:
+            return RiskDecision.deny("consecutive_loss_breaker",
+                                     losses=self.state["consecutive_losses"])
+
+        recent = [t for t in self.state.get("recent_entry_ts", []) if t >= now - 3600.0]
+        if len(recent) >= L.max_trades_per_hour:
+            return RiskDecision.deny("overtrading_hourly",
+                                     trades_last_hour=len(recent),
+                                     limit=L.max_trades_per_hour)
+
+        if self.state["day_trade_count"] >= L.max_trades_per_day:
+            return RiskDecision.deny("overtrading_daily",
+                                     trades_today=self.state["day_trade_count"],
+                                     limit=L.max_trades_per_day)
+
+        if equity > 0:
+            bleed = self.state["day_funding_paid"] / equity
+            if bleed >= L.max_funding_bleed_pct_per_day:
+                return RiskDecision.deny("funding_bleed_limit",
+                                         bleed_pct=round(bleed, 5),
+                                         limit=L.max_funding_bleed_pct_per_day)
+
+        return RiskDecision(allowed=True, reason="account_ok")
+
+    # -- entry gate ----------------------------------------------------------
+
+    def evaluate_entry(self, *,
+                       pair: str,
+                       side: str,
+                       entry_price: float,
+                       stop_price: float,
+                       equity: float,
+                       target_price: Optional[float] = None,
+                       atr_pct: Optional[float] = None,
+                       open_positions: Sequence[Dict[str, Any]] = (),
+                       mmr: Optional[float] = None,
+                       now: Optional[float] = None) -> RiskDecision:
+        """
+        open_positions: list of plain dicts, e.g.
+            [{"pair": "XRP-USDT", "side": "long", "notional": 420.0}, ...]
+        Build this from whatever your position object looks like -- the risk
+        layer deliberately does not import your types.
+        """
+        now = now if now is not None else time.time()
+        L = self.limits
+        side = side.lower()
+        warnings: List[str] = []
+
+        acct = self.account_status(equity, now=now)
+        if not acct.allowed:
+            return acct
+
+        # --- input sanity ---
+        if entry_price <= 0 or stop_price <= 0 or equity <= 0:
+            return RiskDecision.deny("invalid_inputs",
+                                     entry=entry_price, stop=stop_price, equity=equity)
+        if side not in ("long", "short"):
+            return RiskDecision.deny("invalid_side", side=side)
+        if side == "long" and stop_price >= entry_price:
+            return RiskDecision.deny("stop_on_wrong_side",
+                                     side=side, entry=entry_price, stop=stop_price)
+        if side == "short" and stop_price <= entry_price:
+            return RiskDecision.deny("stop_on_wrong_side",
+                                     side=side, entry=entry_price, stop=stop_price)
+
+        sd = stop_distance_pct(entry_price, stop_price)
+        if sd < L.min_stop_distance_pct:
+            return RiskDecision.deny("stop_too_tight",
+                                     stop_distance=round(sd, 5),
+                                     minimum=L.min_stop_distance_pct)
+        if sd > L.max_stop_distance_pct:
+            return RiskDecision.deny("stop_too_wide",
+                                     stop_distance=round(sd, 5),
+                                     maximum=L.max_stop_distance_pct)
+
+        # --- volatility regime ---
+        if atr_pct is not None:
+            if atr_pct >= L.atr_pct_ceiling:
+                return RiskDecision.deny("volatility_spike_no_trade",
+                                         atr_pct=round(atr_pct, 5),
+                                         ceiling=L.atr_pct_ceiling)
+            if atr_pct <= L.atr_pct_floor:
+                return RiskDecision.deny("volatility_too_low",
+                                         atr_pct=round(atr_pct, 5),
+                                         floor=L.atr_pct_floor)
+
+        # --- fee-adjusted expectancy ---
+        if target_price is not None:
+            rr = rr_after_fees(entry_price, stop_price, target_price, L.taker_fee_pct)
+            if rr < L.min_rr_after_fees:
+                return RiskDecision.deny("rr_after_fees_too_low",
+                                         rr_net=round(rr, 3),
+                                         minimum=L.min_rr_after_fees)
+            if rr < L.min_rr_after_fees * 1.15:
+                warnings.append(f"rr_net={rr:.2f} is close to the floor")
+
+        # --- position count / correlation clustering ---
+        grp = group_of(pair)
+        if len(open_positions) >= L.max_concurrent_positions:
+            return RiskDecision.deny("max_concurrent_positions",
+                                     open=len(open_positions),
+                                     limit=L.max_concurrent_positions)
+
+        same_pair = [p for p in open_positions if p.get("pair", "").upper() == pair.upper()]
+        if same_pair:
+            return RiskDecision.deny("already_in_pair", pair=pair)
+
+        same_group = [p for p in open_positions if group_of(p.get("pair", "")) == grp]
+        if len(same_group) >= L.max_positions_per_group:
+            return RiskDecision.deny("correlation_cluster_limit",
+                                     group=grp,
+                                     open_in_group=len(same_group),
+                                     limit=L.max_positions_per_group)
+
+        # Opposing directions inside one correlation group is usually an
+        # accident of two strategies disagreeing, not a considered hedge.
+        opposing = [p for p in same_group if p.get("side", "").lower() != side]
+        if opposing:
+            warnings.append(
+                f"opposing exposure in group '{grp}': "
+                f"{[p.get('pair') for p in opposing]}"
+            )
+
+        # --- sizing from risk ---
+        risk_pct = min(L.risk_pct_per_trade, L.risk_pct_max)
+        risk_amount = equity * risk_pct
+        notional = risk_amount / sd
+
+        # --- leverage cap (enforced here because set-leverage 152404) ---
+        lev_cap = L.leverage_cap_for(pair)
+        max_notional_by_lev = equity * lev_cap
+        if notional > max_notional_by_lev:
+            warnings.append(
+                f"notional capped by leverage {lev_cap}x "
+                f"({notional:.2f} -> {max_notional_by_lev:.2f})"
+            )
+            notional = max_notional_by_lev
+
+        # --- portfolio exposure caps ---
+        current_total = sum(float(p.get("notional", 0.0)) for p in open_positions)
+        room_total = equity * L.max_portfolio_exposure_pct - current_total
+        if room_total <= 0:
+            return RiskDecision.deny("portfolio_exposure_exhausted",
+                                     current_notional=round(current_total, 2),
+                                     limit=round(equity * L.max_portfolio_exposure_pct, 2))
+        if notional > room_total:
+            warnings.append(f"notional capped by portfolio exposure "
+                            f"({notional:.2f} -> {room_total:.2f})")
+            notional = room_total
+
+        current_group = sum(float(p.get("notional", 0.0)) for p in same_group)
+        room_group = equity * L.max_group_exposure_pct - current_group
+        if room_group <= 0:
+            return RiskDecision.deny("group_exposure_exhausted",
+                                     group=grp,
+                                     current_notional=round(current_group, 2))
+        if notional > room_group:
+            warnings.append(f"notional capped by group '{grp}' exposure "
+                            f"({notional:.2f} -> {room_group:.2f})")
+            notional = room_group
+
+        eff_lev = notional / equity if equity > 0 else 0.0
+
+        # --- liquidation buffer ---
+        # Checked against the EFFECTIVE leverage of the sized position, not the
+        # account's nominal leverage setting.
+        m = mmr if mmr is not None else L.default_mmr
+        ld = liq_distance_pct(max(eff_lev, 1e-9), m)
+        if ld <= 0:
+            return RiskDecision.deny("leverage_implies_instant_liquidation",
+                                     effective_leverage=round(eff_lev, 3), mmr=m)
+        # The stop must fire with at least liq_buffer_pct of the entry->liq
+        # distance still unused.
+        max_allowed_stop = ld * (1.0 - L.liq_buffer_pct)
+        if sd > max_allowed_stop:
+            return RiskDecision.deny("liquidation_buffer_violation",
+                                     stop_distance=round(sd, 5),
+                                     liq_distance=round(ld, 5),
+                                     max_stop_allowed=round(max_allowed_stop, 5),
+                                     effective_leverage=round(eff_lev, 3))
+
+        # --- final assembly ---
+        qty = notional / entry_price
+        margin = notional / eff_lev if eff_lev > 0 else notional
+        realised_risk = notional * sd
+        fee_cost = notional * L.taker_fee_pct * 2.0
+
+        if realised_risk > equity * L.risk_pct_max * 1.0001:
+            return RiskDecision.deny("sizing_invariant_violated",
+                                     risk_amount=round(realised_risk, 4),
+                                     ceiling=round(equity * L.risk_pct_max, 4))
+
+        if fee_cost > realised_risk * 0.25:
+            warnings.append(
+                f"fees are {fee_cost / realised_risk:.0%} of trade risk"
+            )
+
+        return RiskDecision(
+            allowed=True,
+            reason="ok",
+            notional=round(notional, 6),
+            qty=round(qty, 8),
+            margin=round(margin, 6),
+            risk_amount=round(realised_risk, 6),
+            effective_leverage=round(eff_lev, 4),
+            warnings=warnings,
+            detail={
+                "pair": pair,
+                "side": side,
+                "group": grp,
+                "stop_distance_pct": round(sd, 5),
+                "liq_distance_pct": round(ld, 5),
+                "est_round_trip_fees": round(fee_cost, 4),
+                "day_realized_pnl": round(self.state["day_realized_pnl"], 4),
+                "consecutive_losses": self.state["consecutive_losses"],
+            },
         )
-        if not v:
-            declog.log(pair, "risk_block", str(v))
-            return
 
-    peace.py — after a close confirms:
+    # -- introspection -------------------------------------------------------
 
-        RISK.record_close(pair=pair, net_pnl=net, equity_after=eq_after)
+    def snapshot(self) -> Dict[str, Any]:
+        return dict(self.state)
 
-    tg.py — add a /risk command returning RISK.status().
 
-    Note this sits *inside* your existing LIVE_TRADING_ENABLED guard stack, not
-    in place of it. Five guards plus this is six. That is correct.
-    """
+# ---------------------------------------------------------------------------
+# Self-test
+# ---------------------------------------------------------------------------
+
+def _selftest() -> int:
+    import shutil
+    tmpdir = tempfile.mkdtemp(prefix="risktest_")
+    state = os.path.join(tmpdir, "risk_state.json")
+    pause = os.path.join(tmpdir, "PAUSED")
+    failures = 0
+
+    def check(name: str, cond: bool, extra: str = "") -> None:
+        nonlocal failures
+        if cond:
+            print(f"  PASS  {name}")
+        else:
+            failures += 1
+            print(f"  FAIL  {name} {extra}")
+
+    EQ = 10_000.0
+    print("\n== risk.py self-test ==\n")
+
+    # 1. clean entry
+    e = RiskEngine(state_path=state, pause_flag_path=pause)
+    e.roll_day_if_needed(EQ)
+    d = e.evaluate_entry(pair="XRP-USDT", side="long", entry_price=0.50,
+                         stop_price=0.485, target_price=0.5375,
+                         equity=EQ, atr_pct=0.02)
+    check("clean long allowed", d.allowed, d.reason)
+    check("risk == 1% of equity", abs(d.risk_amount - 100.0) < 0.5,
+          f"got {d.risk_amount}")
+    check("notional ~= risk/stop_dist", abs(d.notional - (100.0 / 0.03)) < 5.0,
+          f"got {d.notional}")
+
+    # 2. stop on the wrong side
+    d = e.evaluate_entry(pair="SOL-USDT", side="long", entry_price=100.0,
+                         stop_price=104.0, equity=EQ, atr_pct=0.02)
+    check("inverted stop rejected", not d.allowed and d.reason == "stop_on_wrong_side",
+          d.reason)
+
+    # 3. volatility spike
+    d = e.evaluate_entry(pair="SOL-USDT", side="long", entry_price=100.0,
+                         stop_price=97.0, equity=EQ, atr_pct=0.15)
+    check("vol spike blocks entry",
+          not d.allowed and d.reason == "volatility_spike_no_trade", d.reason)
+
+    # 4. RR after fees
+    d = e.evaluate_entry(pair="SOL-USDT", side="long", entry_price=100.0,
+                         stop_price=97.0, target_price=101.5,
+                         equity=EQ, atr_pct=0.02)
+    check("thin RR rejected after fees",
+          not d.allowed and d.reason == "rr_after_fees_too_low", d.reason)
+
+    # 5. correlation cluster
+    opens = [{"pair": "BTC-USDT", "side": "long", "notional": 3000.0},
+             {"pair": "ETH-USDT", "side": "long", "notional": 3000.0}]
+    d = e.evaluate_entry(pair="BTC-USDT", side="long", entry_price=60000.0,
+                         stop_price=58800.0, equity=EQ, atr_pct=0.02,
+                         open_positions=opens)
+    check("duplicate pair rejected", not d.allowed and d.reason == "already_in_pair",
+          d.reason)
+
+    opens2 = [{"pair": "SOL-USDT", "side": "long", "notional": 2000.0},
+              {"pair": "AVAX-USDT", "side": "long", "notional": 2000.0}]
+    d = e.evaluate_entry(pair="NEAR-USDT", side="long", entry_price=5.0,
+                         stop_price=4.85, equity=EQ, atr_pct=0.02,
+                         open_positions=opens2)
+    check("third L1 blocked by cluster limit",
+          not d.allowed and d.reason == "correlation_cluster_limit", d.reason)
+
+    # 6. portfolio exposure ceiling
+    heavy = [{"pair": "DOGE-USDT", "side": "long", "notional": 29_500.0}]
+    d = e.evaluate_entry(pair="XRP-USDT", side="long", entry_price=0.50,
+                         stop_price=0.485, equity=EQ, atr_pct=0.02,
+                         open_positions=heavy)
+    check("exposure ceiling caps or denies",
+          (not d.allowed) or d.notional <= 500.1,
+          f"allowed={d.allowed} notional={d.notional}")
+
+    # 7a. THE CENTRAL INVARIANT: risk-based sizing makes liquidation unreachable.
+    #     Because notional = risk_amt / stop_dist, effective leverage is
+    #     risk_pct / stop_dist -- typically well under 2x. Liquidation only
+    #     becomes reachable if you size from leverage instead of from risk.
+    wide = RiskLimits(risk_pct_per_trade=0.015, max_effective_leverage=20.0,
+                      max_portfolio_exposure_pct=20.0, max_group_exposure_pct=20.0,
+                      min_stop_distance_pct=0.001)
+    e2 = RiskEngine(limits=wide, state_path=os.path.join(tmpdir, "s2.json"),
+                    pause_flag_path=pause)
+    e2.roll_day_if_needed(EQ)
+    d = e2.evaluate_entry(pair="BTC-USDT", side="long", entry_price=60000.0,
+                          stop_price=57000.0, equity=EQ, atr_pct=0.02)
+    check("risk-sized 5% stop is allowed", d.allowed, d.reason)
+    check("risk-sizing keeps liq >10x further than stop",
+          d.allowed and d.detail["liq_distance_pct"] > d.detail["stop_distance_pct"] * 10,
+          f"liq={d.detail.get('liq_distance_pct')} stop={d.detail.get('stop_distance_pct')}")
+    check("effective leverage stays under 1x", d.allowed and d.effective_leverage < 1.0,
+          f"got {d.effective_leverage}")
+
+    # 7b. Buffer path coverage: only reachable at absurd leverage, which is
+    #     exactly its job -- it is a backstop that catches a sizing BUG, not a
+    #     constraint that fires in normal operation.
+    insane = RiskLimits(risk_pct_per_trade=0.50, risk_pct_max=0.50,
+                        max_effective_leverage=200.0,
+                        max_portfolio_exposure_pct=200.0,
+                        max_group_exposure_pct=200.0,
+                        min_stop_distance_pct=0.0001,
+                        default_mmr=0.004,
+                        max_leverage_by_group={"majors": 200.0})
+    e2b = RiskEngine(limits=insane, state_path=os.path.join(tmpdir, "s2b.json"),
+                     pause_flag_path=pause)
+    e2b.roll_day_if_needed(EQ)
+    d = e2b.evaluate_entry(pair="BTC-USDT", side="long", entry_price=60000.0,
+                           stop_price=59850.0, equity=EQ, atr_pct=0.02)
+    check("liq buffer fires at 200x effective leverage",
+          not d.allowed and d.reason == "liquidation_buffer_violation",
+          f"{d.reason} {d.detail}")
+
+    # 7c. Pure-function check on the liquidation math itself.
+    check("liq_distance_pct(10x, 0.5%) ~= 9.5%",
+          abs(liq_distance_pct(10.0, 0.005) - 0.095) < 1e-9,
+          f"got {liq_distance_pct(10.0, 0.005)}")
+    check("liq_distance_pct clamps at zero",
+          liq_distance_pct(500.0, 0.010) == 0.0)
+
+    # 8. daily drawdown halt
+    e3 = RiskEngine(state_path=os.path.join(tmpdir, "s3.json"), pause_flag_path=pause)
+    e3.roll_day_if_needed(EQ)
+    d = e3.evaluate_entry(pair="XRP-USDT", side="long", entry_price=0.50,
+                          stop_price=0.485, equity=9_400.0, atr_pct=0.02)
+    check("6% daily DD halts trading",
+          not d.allowed and d.reason == "daily_drawdown_limit", d.reason)
+    check("halt persists to state", e3.snapshot()["halted"] is True)
+
+    # 9. consecutive losses -> cooldown
+    e4 = RiskEngine(state_path=os.path.join(tmpdir, "s4.json"), pause_flag_path=pause)
+    e4.roll_day_if_needed(EQ)
+    for _ in range(3):
+        e4.record_close(net_pnl=-100.0, equity_after=EQ - 100.0)
+    d = e4.evaluate_entry(pair="XRP-USDT", side="long", entry_price=0.50,
+                          stop_price=0.485, equity=EQ - 300.0, atr_pct=0.02)
+    check("3 losses trigger cooldown",
+          not d.allowed and d.reason == "loss_streak_cooldown", d.reason)
+
+    e4.record_close(net_pnl=+50.0, equity_after=EQ)
+    check("a win resets the streak counter",
+          e4.snapshot()["consecutive_losses"] == 0)
+
+    # 10. state survives a restart
+    e5 = RiskEngine(state_path=os.path.join(tmpdir, "s3.json"), pause_flag_path=pause)
+    check("halt survives process restart", e5.snapshot()["halted"] is True)
+
+    # 11. PAUSED flag
+    open(pause, "w").close()
+    d = e.evaluate_entry(pair="XRP-USDT", side="long", entry_price=0.50,
+                         stop_price=0.485, equity=EQ, atr_pct=0.02)
+    check("PAUSED flag blocks entry",
+          not d.allowed and d.reason == "paused_flag_present", d.reason)
+    os.remove(pause)
+
+    # 12. overtrading
+    e6 = RiskEngine(state_path=os.path.join(tmpdir, "s6.json"), pause_flag_path=pause)
+    e6.roll_day_if_needed(EQ)
+    for _ in range(3):
+        e6.record_entry()
+    d = e6.evaluate_entry(pair="XRP-USDT", side="long", entry_price=0.50,
+                          stop_price=0.485, equity=EQ, atr_pct=0.02)
+    check("hourly trade cap enforced",
+          not d.allowed and d.reason == "overtrading_hourly", d.reason)
+
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    print(f"\n== {'ALL PASS' if failures == 0 else str(failures) + ' FAILURE(S)'} ==\n")
+    return failures
 
 
 if __name__ == "__main__":
-    import sys
-    rm = RiskManager(state_path=sys.argv[1] if len(sys.argv) > 1 else "/tmp/risk_state.json")
-    print(json.dumps(rm.status(), indent=2))
+    raise SystemExit(1 if _selftest() else 0)

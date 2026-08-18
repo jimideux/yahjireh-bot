@@ -54,7 +54,7 @@ from joy import send
 from exchange.blofin import BloFinClient, LIVE_TRADING_ENABLED
 from ltf_signals import LTFScanner, LTFConfig, normalize_candles
 import runner_ltf                                   # reuse discover_pairs + knobs
-from risk import RiskManager, RiskConfig, OpenPosition
+from risk_ltf import RiskManager, RiskConfig, OpenPosition
 
 # ---------------------------------------------------------------------------
 # Knobs — this block is yours
