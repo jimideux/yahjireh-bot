@@ -303,7 +303,7 @@ class Executor:
         journal_row({"ts": time.time(), "pair": pair, "event": "telemetry",
                      "max_upnl": round(max_upnl, 2),
                      "lock_arm": LOCK_ARM_USD,
-                     "ladder_reachable": max_upnl >= LOCK_ARM_USD})
+                     "ladder_reachable": max_upnl >= LOCK_ARM_USD, "equity": round(equity, 2), "usable": round(usable, 2), "exposure_after": round(sum(p["notional"] for p in self.state.values()), 2)})
         tag = "🧪 DRY" if dry else "🤖 LIVE"
         await send(f"{tag} EXEC ▸ {sig.direction.upper()} {pair}\n"
                    f"entry {fill:,.6g} · stop {sig.stop:,.6g} · "
