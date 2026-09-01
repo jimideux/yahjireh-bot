@@ -79,6 +79,9 @@ WATCH_INTERVAL_S = 5             # position management cadence (peace uses 5)
 BAR_S = 900
 GRACE_S = 8                      # enter a touch after the alert runner wakes
 
+DRY_EQUITY_START = love_cfg.initial_capital   # paper baseline: 1878 from love.py
+PAPER_PATH = "/root/trading/ltf_exec_paper.json"  # persisted paper equity (dry only)
+
 STATE_PATH = "/root/trading/ltf_exec_positions.json"
 TRADES_PATH = "/root/trading/ltf_exec_trades.jsonl"
 
@@ -117,6 +120,23 @@ def save_state(st: dict) -> None:
     with open(tmp, "w") as fh:
         json.dump(st, fh, indent=2)
     os.replace(tmp, STATE_PATH)
+
+
+def load_paper() -> float:
+    """Paper equity for dry mode. Starts at DRY_EQUITY_START, compounds every
+    dry close, survives restarts. Never consulted when the guards are open."""
+    try:
+        with open(PAPER_PATH) as fh:
+            return float(json.load(fh)["equity"])
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
+        return float(DRY_EQUITY_START)
+
+
+def save_paper(eq: float) -> None:
+    tmp = PAPER_PATH + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"equity": round(eq, 2)}, fh)
+    os.replace(tmp, PAPER_PATH)
 
 
 def journal_row(row: dict) -> None:
@@ -194,6 +214,16 @@ class Executor:
         ac = str((await self.inst(inst_id)).get("assetClass", "")).lower()
         return (not ac) or ac.startswith("crypt")
 
+    # -- equity source ---------------------------------------------------------
+
+    async def equity(self) -> float:
+        """Real equity when the guards are open (live/demo); paper equity while
+        they're closed. An empty real account must never switch off a dry run —
+        that coupling cost eleven days of data in August 2026."""
+        if _dry():
+            return load_paper()
+        return await self.client.get_equity()
+
     # -- entry gate ----------------------------------------------------------
 
     async def pair_is_free(self, inst_id: str) -> tuple[bool, str]:
@@ -221,7 +251,7 @@ class Executor:
             _log(f"skip {pair}: {why}")
             return False
 
-        equity = await self.client.get_equity()
+        equity = await self.equity()
         usable = max(0.0, equity - RESERVE_USD)
         if usable <= 0:
             _log(f"skip {pair}: no usable equity (eq={equity:.2f})")
@@ -335,8 +365,12 @@ class Executor:
         gross = (exit_px - pos["entry"]) * sign * pos["contracts"] * pos["cv"]
         fees = pos["notional"] * FEE_RT
         net = gross - fees
-        self.risk.record_close(pair=pair, net_pnl=net,
-                               equity_after=await self.client.get_equity())
+        if pos["dry"]:
+            eq_after = load_paper() + net          # paper account compounds
+            save_paper(eq_after)
+        else:
+            eq_after = await self.client.get_equity()
+        self.risk.record_close(pair=pair, net_pnl=net, equity_after=eq_after)
         journal_row({"ts": time.time(), "pair": pair, "event": "close",
                      "dry": pos["dry"], "reason": reason, "exit": exit_px,
                      "gross": round(gross, 2), "net": round(net, 2),
@@ -440,9 +474,10 @@ async def main() -> None:
     client = BloFinClient()
     ex = Executor(client)
     mode = "DRY-RUN (guards closed)" if _dry() else "⚠️ LIVE"
+    paper = f", paper equity ${load_paper():,.2f}" if _dry() else ""
     _log(f"sniper-ltf-exec up — {mode}, exit_mode={EXIT_MODE}, "
          f"risk {RISK_PCT_PER_TRADE:.1%}/trade, slots {MAX_EXEC_SLOTS}, "
-         f"crypto_only={CRYPTO_ONLY}, tracking {len(ex.state)} position(s)")
+         f"crypto_only={CRYPTO_ONLY}, tracking {len(ex.state)} position(s){paper}")
     await send(f"{'🧪' if _dry() else '🤖'} sniper-ltf-exec online — "
                f"{'dry-run' if _dry() else 'LIVE'}, mode {EXIT_MODE}, "
                f"{RISK_PCT_PER_TRADE:.1%} risk, {MAX_EXEC_SLOTS} slots")
