@@ -50,7 +50,7 @@ sys.path.insert(0, "/root/trading")
 
 import ownership                                    # read-only: is_owned()
 from love import config as love_cfg
-from joy import send
+import joy
 from exchange.blofin import BloFinClient, LIVE_TRADING_ENABLED
 from ltf_signals import LTFScanner, LTFConfig, normalize_candles
 import runner_ltf                                   # reuse discover_pairs + knobs
@@ -62,10 +62,14 @@ from risk_ltf import RiskManager, RiskConfig, OpenPosition
 
 EXIT_MODE = "ratchet"            # "fixed" | "lock_once" | "ratchet"
 
-LOCK_ARM_USD = 25.0              # your number: up $25 -> start locking
-LOCK_FIRST_USD = 5.0             # first lock: breakeven + ~fees
-LOCK_STEP_HIGH = 40.0            # at +$40 high-water, lock the full $25
-LADDER_GAP_USD = 15.0            # above that: stop trails high-water by $15
+# R-based ladder (v1.2): scales with each trade's own risk, so it arms at any
+# account size. The old $25 arm sat above the $24.20 sizing ceiling — 13/13
+# trades produced identical counterfactuals; the instrument couldn't measure.
+ARM_R = 1.0                      # high-water >= +1R arms the ladder
+LOCK1_R = 0.2                    # first lock: +0.2R (covers fees, scratch-out)
+STEP2_R = 1.6                    # at +1.6R high-water ...
+LOCK2_R = 0.8                    # ... lock +0.8R
+TRAIL_R = 0.8                    # beyond: lock trails high-water by 0.8R
 
 RISK_PCT_PER_TRADE = 0.010       # 1% of usable equity risked per trade
 MAX_EXEC_SLOTS = 2               # concurrent executor positions
@@ -101,6 +105,15 @@ def _log(msg: str) -> None:
 
 def _dry() -> bool:
     return not LIVE_TRADING_ENABLED
+
+
+async def safe_send(text: str) -> None:
+    """A dead Telegram must never kill the executor. Two crash-restarts on
+    Sep 1-2 traced to unwrapped send() calls; this is the tourniquet."""
+    try:
+        await joy.send(text)
+    except Exception as e:                             # noqa: BLE001
+        _log(f"telegram send failed (non-fatal): {e!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -148,26 +161,29 @@ def journal_row(row: dict) -> None:
 # Exit-mode engine (pure; unit-tested)
 # ---------------------------------------------------------------------------
 
-def ratchet_lock(high_usd: float) -> float | None:
-    """Jimi's ladder, shaped like peace.get_trail_lock with his $25 arm."""
-    if high_usd >= 100.0:
-        return high_usd - 18.0
-    if high_usd >= 70.0:
-        return high_usd - 16.0
-    if high_usd >= LOCK_STEP_HIGH:
-        return max(LOCK_ARM_USD, high_usd - LADDER_GAP_USD)
-    if high_usd >= LOCK_ARM_USD:
-        return LOCK_FIRST_USD
+def ratchet_lock(high_usd: float, risk_usd: float) -> float | None:
+    """Jimi's ladder in R-units: arms at +1R, tightens as the trade extends."""
+    if risk_usd <= 0:
+        return None
+    hr = high_usd / risk_usd
+    if hr >= STEP2_R + TRAIL_R:
+        return (hr - TRAIL_R) * risk_usd
+    if hr >= STEP2_R:
+        return LOCK2_R * risk_usd
+    if hr >= ARM_R:
+        return LOCK1_R * risk_usd
     return None
 
 
-def lock_once_lock(high_usd: float) -> float | None:
-    return LOCK_FIRST_USD if high_usd >= LOCK_ARM_USD else None
+def lock_once_lock(high_usd: float, risk_usd: float) -> float | None:
+    if risk_usd <= 0:
+        return None
+    return LOCK1_R * risk_usd if high_usd / risk_usd >= ARM_R else None
 
 
 def decide_exit(mode: str, *, mark: float, entry: float, stop: float,
                 target: float, side: str, upnl: float,
-                high_usd: float) -> tuple[str, float] | None:
+                high_usd: float, risk_usd: float) -> tuple[str, float] | None:
     """Returns (reason, exit_price) if this mode exits now, else None.
     Price-level exits use the level itself (that's where the exchange order
     would fill); lock exits use mark (software close)."""
@@ -178,7 +194,8 @@ def decide_exit(mode: str, *, mark: float, entry: float, stop: float,
         return ("target", target)
     if mode == "fixed":
         return None
-    lock = ratchet_lock(high_usd) if mode == "ratchet" else lock_once_lock(high_usd)
+    lock = (ratchet_lock(high_usd, risk_usd) if mode == "ratchet"
+            else lock_once_lock(high_usd, risk_usd))
     if lock is not None and upnl > 0 and upnl <= lock:
         return (f"lock@{lock:.0f}", mark)
     return None
@@ -324,18 +341,14 @@ class Executor:
                      ("side", "entry", "stop", "target", "contracts",
                       "notional", "mode")}})
         max_upnl = abs(sig.target - fill) * contracts * cv
+        risk_usd = abs(fill - sig.stop) * contracts * cv
         ladder_note = ""
-        if EXIT_MODE != "fixed" and max_upnl < LOCK_ARM_USD:
-            ladder_note = (f"\n⚠ ladder unreachable: max +${max_upnl:,.0f} "
-                           f"< ${LOCK_ARM_USD:,.0f} arm — TP fills first")
-            _log(f"{pair}: lock ladder unreachable "
-                 f"(max +${max_upnl:.0f} < arm ${LOCK_ARM_USD:.0f})")
         journal_row({"ts": time.time(), "pair": pair, "event": "telemetry",
                      "max_upnl": round(max_upnl, 2),
-                     "lock_arm": LOCK_ARM_USD,
-                     "ladder_reachable": max_upnl >= LOCK_ARM_USD, "equity": round(equity, 2), "usable": round(usable, 2), "exposure_after": round(sum(p["notional"] for p in self.state.values()), 2)})
+                     "risk_usd": round(risk_usd, 2),
+                     "arm_at_usd": round(ARM_R * risk_usd, 2), "equity": round(equity, 2), "usable": round(usable, 2), "exposure_after": round(sum(p["notional"] for p in self.state.values()), 2)})
         tag = "🧪 DRY" if dry else "🤖 LIVE"
-        await send(f"{tag} EXEC ▸ {sig.direction.upper()} {pair}\n"
+        await safe_send(f"{tag} EXEC ▸ {sig.direction.upper()} {pair}\n"
                    f"entry {fill:,.6g} · stop {sig.stop:,.6g} · "
                    f"target {sig.target:,.6g}\n"
                    f"size {contracts} (${notional:,.0f}) · mode {EXIT_MODE} · "
@@ -377,7 +390,7 @@ class Executor:
                      "high_usd": round(pos["high_usd"], 2),
                      "virtual": pos["virtual"], "mode": pos["mode"]})
         tag = "🧪 DRY" if pos["dry"] else "🤖 LIVE"
-        await send(f"{tag} EXEC ▪ CLOSED {pair} — {reason}\n"
+        await safe_send(f"{tag} EXEC ▪ CLOSED {pair} — {reason}\n"
                    f"net {'+' if net >= 0 else ''}{net:,.2f} USD "
                    f"(peak +{pos['high_usd']:,.2f})")
         del self.state[pair]
@@ -415,6 +428,7 @@ class Executor:
 
                 sign = 1.0 if pos["side"] == "long" else -1.0
                 upnl = (mark - pos["entry"]) * sign * pos["contracts"] * pos["cv"]
+                risk_usd = abs(pos["entry"] - pos["stop"]) * pos["contracts"] * pos["cv"]
                 if upnl > pos["high_usd"]:
                     pos["high_usd"] = upnl
 
@@ -424,7 +438,8 @@ class Executor:
                         d = decide_exit(m, mark=mark, entry=pos["entry"],
                                         stop=pos["stop"], target=pos["target"],
                                         side=pos["side"], upnl=upnl,
-                                        high_usd=pos["high_usd"])
+                                        high_usd=pos["high_usd"],
+                                        risk_usd=risk_usd)
                         if d:
                             r, px = d
                             g = (px - pos["entry"]) * sign * pos["contracts"] * pos["cv"]
@@ -434,7 +449,7 @@ class Executor:
                 d = decide_exit(pos["mode"], mark=mark, entry=pos["entry"],
                                 stop=pos["stop"], target=pos["target"],
                                 side=pos["side"], upnl=upnl,
-                                high_usd=pos["high_usd"])
+                                high_usd=pos["high_usd"], risk_usd=risk_usd)
                 save_state(self.state)
                 if d:
                     await self.close_position(pair, d[0], d[1])
@@ -478,7 +493,7 @@ async def main() -> None:
     _log(f"sniper-ltf-exec up — {mode}, exit_mode={EXIT_MODE}, "
          f"risk {RISK_PCT_PER_TRADE:.1%}/trade, slots {MAX_EXEC_SLOTS}, "
          f"crypto_only={CRYPTO_ONLY}, tracking {len(ex.state)} position(s){paper}")
-    await send(f"{'🧪' if _dry() else '🤖'} sniper-ltf-exec online — "
+    await safe_send(f"{'🧪' if _dry() else '🤖'} sniper-ltf-exec online — "
                f"{'dry-run' if _dry() else 'LIVE'}, mode {EXIT_MODE}, "
                f"{RISK_PCT_PER_TRADE:.1%} risk, {MAX_EXEC_SLOTS} slots")
     if "--once" in sys.argv:
