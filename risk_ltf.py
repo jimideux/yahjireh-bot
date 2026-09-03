@@ -256,8 +256,14 @@ class RiskManager:
             self.state["halt_reason"] = "daily_loss_usd"
 
         # 4. loss streak ----------------------------------------------------
-        if self.state["consecutive_losses"] >= cfg.consecutive_loss_limit:
-            reasons.append(f"{self.state['consecutive_losses']} consecutive losses")
+        # The breaker's teeth are the cooldown that record_close arms. Once it
+        # has been served, trading must resume: a streak-alone block deadlocks
+        # the engine (no trades -> no win -> no reset). Found live Sep 3 2026
+        # after ENA/HYPE/PUMP tripped it and nothing could ever clear it.
+        if (self.state["consecutive_losses"] >= cfg.consecutive_loss_limit
+                and now < self.state["cooldown_until"]):
+            reasons.append(f"{self.state['consecutive_losses']} consecutive "
+                           f"losses (breaker cooling down)")
 
         # 5. slot / exposure / cluster --------------------------------------
         if len(open_positions) >= cfg.max_concurrent_positions:
