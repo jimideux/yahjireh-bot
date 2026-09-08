@@ -52,8 +52,8 @@ import ownership                                    # read-only: is_owned()
 from love import config as love_cfg
 import joy
 from exchange.blofin import BloFinClient, LIVE_TRADING_ENABLED
-from ltf_signals import LTFScanner, LTFConfig, normalize_candles
-import runner_ltf                                   # reuse discover_pairs + knobs
+import g2_signals as G2
+from g2_signals import Signal
 from risk_ltf import RiskManager, RiskConfig, OpenPosition
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ SLIPPAGE_BP = 2.0                # dry-run fill realism: 0.02% adverse on market
 FEE_RT = 0.0012                  # taker round-trip, matches all prior math
 
 WATCH_INTERVAL_S = 5             # position management cadence (peace uses 5)
-BAR_S = 900
+BAR_S = 3600                     # Gen 2: 1H bars
 GRACE_S = 8                      # enter a touch after the alert runner wakes
 
 DRY_EQUITY_START = love_cfg.initial_capital   # paper baseline: 1878 from love.py
@@ -89,13 +89,10 @@ PAPER_PATH = "/root/trading/ltf_exec_paper.json"  # persisted paper equity (dry 
 STATE_PATH = "/root/trading/ltf_exec_positions.json"
 TRADES_PATH = "/root/trading/ltf_exec_trades.jsonl"
 
-SCAN_CFG = LTFConfig(
-    ltf="15m", htf="4H",
-    alert_style="minimal",
-    mode="strict",               # executor takes A-grades ONLY
-    max_alerts_per_day=10,       # entry budget, separate from alert budget
-    cooldown_per_pair_s=4 * 3600,
-)
+PAIRS = list(love_cfg.active_pairs)      # Gen 2: the 6 configured majors
+COOLDOWN_PER_PAIR_S = 6 * 3600           # one re-entry lane per pair per 6h
+MAX_ENTRIES_PER_DAY = 10
+THROTTLE_S = 0.4
 EXEC_SCAN_STATE = "/root/trading/ltf_exec_scan_state.json"
 
 
@@ -119,6 +116,21 @@ async def safe_send(text: str) -> None:
 # ---------------------------------------------------------------------------
 # Position state (survives Restart=always)
 # ---------------------------------------------------------------------------
+
+def _load_scan() -> dict:
+    try:
+        with open(EXEC_SCAN_STATE) as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_scan(d: dict) -> None:
+    tmp = EXEC_SCAN_STATE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(d, fh)
+    os.replace(tmp, EXEC_SCAN_STATE)
+
 
 def load_state() -> dict:
     try:
@@ -209,7 +221,7 @@ class Executor:
 
     def __init__(self, client: BloFinClient):
         self.client = client
-        self.scanner = LTFScanner(SCAN_CFG, state_path=EXEC_SCAN_STATE)
+        self.scan_state = _load_scan()
         self.risk = RiskManager(RiskConfig(
             max_risk_pct_per_trade=RISK_PCT_PER_TRADE,
             max_concurrent_positions=MAX_EXEC_SLOTS,
@@ -383,7 +395,12 @@ class Executor:
             save_paper(eq_after)
         else:
             eq_after = await self.client.get_equity()
-        self.risk.record_close(pair=pair, net_pnl=net, equity_after=eq_after)
+        risk_usd = abs(pos["entry"] - pos["stop"]) * pos["contracts"] * pos["cv"]
+        scratch = net < 0 and risk_usd > 0 and abs(net) < 0.1 * risk_usd
+        if scratch:
+            _log(f"{pair}: scratch loss {net:+.2f} (<0.1R) — not counted toward streak")
+        self.risk.record_close(pair=pair, net_pnl=net, equity_after=eq_after,
+                               count_streak=not scratch)
         journal_row({"ts": time.time(), "pair": pair, "event": "close",
                      "dry": pos["dry"], "reason": reason, "exit": exit_px,
                      "gross": round(gross, 2), "net": round(net, 2),
@@ -462,27 +479,57 @@ class Executor:
         free_slots = MAX_EXEC_SLOTS - len(self.state)
         if free_slots <= 0:
             return
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        if self.scan_state.get("day") != day:
+            self.scan_state = {"day": day, "count": 0,
+                               "seen": self.scan_state.get("seen", [])[-500:],
+                               "last": self.scan_state.get("last", {})}
+        try:
+            btc = await G2.btc_daily_trend(self.client)
+        except Exception as e:                         # noqa: BLE001
+            _log(f"btc trend error: {e!r}")
+            btc = "neutral"
         signals = []
         for pair in pairs:
             try:
-                ltf = normalize_candles(await self.client.get_candles(
-                    pair, bar=SCAN_CFG.ltf, limit=200))
-                htf = normalize_candles(await self.client.get_candles(
-                    pair, bar=SCAN_CFG.htf, limit=120))
-                sig = self.scanner.scan_pair(pair, ltf, htf)
-                if sig is not None:
+                sig = await G2.scan_pair(self.client, pair, btc)
+                if sig and sig.grade == "A":
                     signals.append(sig)
             except Exception as e:                     # noqa: BLE001
                 _log(f"scan error {pair}: {e!r}")
-            await asyncio.sleep(runner_ltf.THROTTLE_S)
+            await asyncio.sleep(THROTTLE_S)
         signals.sort(key=lambda s: -s.fee_mult)
+        taken_groups = {G2.group_of(p) for p in self.state}
+        now = time.time()
         for sig in signals:
             if free_slots <= 0:
                 break
-            gate = []
-            if self.scanner.maybe_alert(sig, gate.append):
-                if await self.try_enter(sig):
-                    free_slots -= 1
+            if self.scan_state.get("count", 0) >= MAX_ENTRIES_PER_DAY:
+                _log("daily entry budget spent")
+                break
+            key = f"{sig.pair}:{sig.ts}"
+            if key in self.scan_state.get("seen", []):
+                continue
+            if now - self.scan_state.get("last", {}).get(sig.pair, 0) < COOLDOWN_PER_PAIR_S:
+                continue
+            g = G2.group_of(sig.pair)
+            if g in taken_groups:
+                journal_row({"ts": now, "pair": sig.pair, "event": "cluster_skip",
+                             "side": sig.direction, "entry": sig.entry,
+                             "stop": sig.stop, "target": sig.target, "group": g})
+                _log(f"cluster skip {sig.pair}: group '{g}' engaged")
+                self.scan_state.setdefault("seen", []).append(key)
+                self.scan_state["seen"] = self.scan_state["seen"][-500:]
+                _save_scan(self.scan_state)
+                continue
+            if await self.try_enter(sig):
+                free_slots -= 1
+                taken_groups.add(g)
+                self.scan_state.setdefault("seen", []).append(key)
+                self.scan_state["seen"] = self.scan_state["seen"][-500:]
+                self.scan_state["count"] = self.scan_state.get("count", 0) + 1
+                self.scan_state.setdefault("last", {})[sig.pair] = now
+                _save_scan(self.scan_state)
 
 
 async def main() -> None:
@@ -490,7 +537,7 @@ async def main() -> None:
     ex = Executor(client)
     mode = "DRY-RUN (guards closed)" if _dry() else "⚠️ LIVE"
     paper = f", paper equity ${load_paper():,.2f}" if _dry() else ""
-    _log(f"sniper-ltf-exec up — {mode}, exit_mode={EXIT_MODE}, "
+    _log(f"sniper-ltf-exec GEN2/1H up — {mode}, exit_mode={EXIT_MODE}, "
          f"risk {RISK_PCT_PER_TRADE:.1%}/trade, slots {MAX_EXEC_SLOTS}, "
          f"crypto_only={CRYPTO_ONLY}, tracking {len(ex.state)} position(s){paper}")
     await safe_send(f"{'🧪' if _dry() else '🤖'} sniper-ltf-exec online — "
@@ -498,12 +545,8 @@ async def main() -> None:
                f"{RISK_PCT_PER_TRADE:.1%} risk, {MAX_EXEC_SLOTS} slots")
     if "--once" in sys.argv:
         # smoke-test: one discovery, one entry cycle, one watch tick, exit.
-        try:
-            pairs, d = await runner_ltf.discover_pairs(client)
-            _log(f"universe: {d['qualified']} pairs")
-        except Exception as e:                         # noqa: BLE001
-            pairs = list(runner_ltf.CORE_PAIRS)
-            _log(f"discovery failed, core-6: {e!r}")
+        pairs = PAIRS
+        _log(f"gen2 pairs: {', '.join(pairs)}")
         await ex.entry_cycle(pairs)
         await ex.watch_tick()
         _log(f"--once complete: {len(ex.state)} position(s) tracked, "
@@ -513,19 +556,12 @@ async def main() -> None:
         except Exception:                              # noqa: BLE001
             pass
         return
-    pairs, pairs_expiry = list(runner_ltf.CORE_PAIRS), 0.0
+    pairs = PAIRS
+    _log(f"gen2 pairs: {', '.join(pairs)}")
     next_bar = 0.0
     try:
         while True:
             now = time.time()
-            if now >= pairs_expiry:
-                try:
-                    pairs, d = await runner_ltf.discover_pairs(client)
-                    pairs_expiry = now + runner_ltf.PAIRS_TTL_S
-                    _log(f"universe: {d['qualified']} pairs")
-                except Exception as e:                 # noqa: BLE001
-                    pairs, pairs_expiry = list(runner_ltf.CORE_PAIRS), now + 1800
-                    _log(f"discovery failed, core-6 fallback: {e!r}")
             if now >= next_bar:
                 await ex.entry_cycle(pairs)
                 next_bar = (int(now) // BAR_S + 1) * BAR_S + GRACE_S

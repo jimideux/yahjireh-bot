@@ -373,7 +373,8 @@ class RiskManager:
     # -- outcome recording ---------------------------------------------------
 
     def record_close(self, *, pair: str, net_pnl: float, equity_after: float,
-                     funding_paid: float = 0.0, now: Optional[float] = None) -> None:
+                     funding_paid: float = 0.0, now: Optional[float] = None,
+                     count_streak: bool = True) -> None:
         """Call once per closed trade, after fees. peace.py exit path."""
         now = now or time.time()
         self.roll_day_if_needed(equity_after, now)
@@ -383,7 +384,7 @@ class RiskManager:
         self.state["day_funding_paid"] += funding_paid
         self.state["last_close_ts"] = now
 
-        if net_pnl < 0:
+        if net_pnl < 0 and count_streak:
             self.state["consecutive_losses"] += 1
             self.state["last_loss_ts"] = now
             if self.state["consecutive_losses"] >= self.cfg.consecutive_loss_limit:

@@ -2,7 +2,7 @@
 .env.*
 .env.readonly
 *.db
-*.jsonl
+ltf_exec_*.jsonl
 .venv/
 __pycache__/
 *.bak*
