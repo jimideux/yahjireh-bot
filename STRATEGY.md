@@ -157,3 +157,13 @@ Both external reviews (Sep 4) merged; conflicts resolved as noted. Ordering prin
 ## 9. How to audit this
 
 Reproduce everything from three artifacts: the git history (Aug 17 → HEAD; each deploy's arithmetic predicted in advance), `ltf_exec_trades.jsonl` (schema: `open`/`telemetry`/`close`; closes carry gross/net/high-water and the three-mode `virtual` block), and **`stats.py`**, whose output is the only performance claim this project makes — if its reconciliation line says FAIL, distrust every number above it. Strategy logic ~600 lines (`ltf_signals.py`), lifecycle ~530 (`ltf_executor.py`), risk ~470 (`risk_ltf.py`); stdlib-only above the exchange client. Both consultant reviews are on file with the owner; their catches are logged in §7 under their own dates.
+
+---
+
+## Gate 1 verdict — September 8, 2026
+
+FAILED all three checkpoint criteria at n=27 cohort: WR 29.6%, payoff 1.5, same-cycle double-stops in 3 of 4 events. Generation 1 stopped per the section-8 contract; both services disabled; the journal, tooling, and this document are the surviving assets. Total cost of falsification: zero real dollars.
+
+Autopsy (gate1.py, zero ambiguous resolutions): exit ladder VALIDATED, +16.10 vs fixed across 5 lock exits (cohort -70.32 ratchet vs -86.42 pure-fixed); the 4H slope filter did NOT differentiate (strong-slope entries -39.63, weak -30.69); losses concentrated in wide-stop entries (n=19, WR 16%); one-per-cluster rule worth +15.05 over 4 events; time stop moot; fees were 18 of the 70 dollar hole — the signal, not the costs, failed.
+
+Generation 2 inherits: the guard stack, risk_ltf, the executor lifecycle, paper accounting, stats.py and gate1.py, the deploy discipline, the ratchet as default exit, the cluster rule, scratch-aware breaker accounting — and a pre-registered kill line written before its first trade.
